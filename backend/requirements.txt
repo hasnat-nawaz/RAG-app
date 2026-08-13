@@ -1,2 +1,5 @@
-docling
-
+docling>=2.119.0
+pypdf>=6.15.0
+python-dotenv>=1.2.2
+langchain-text-splitters>=1.1.2
+langchain-core>=1.5.4
