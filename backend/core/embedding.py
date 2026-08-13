@@ -143,6 +143,16 @@ def embed_chunks(chunks: list[dict], batch_size: int = DEFAULT_BATCH_SIZE) -> li
     return vectors
 
 
+# Embed a single query string and return that vector.
+def embed_query(query: str) -> list[float]:
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("embed_query expects a non-empty query string.")
+
+    client = _get_client()
+    vectors = _embed_batch(client, [query], "query")
+    return vectors[0]
+
+
 # Local test: embed swarm.chunks.json and print chunk vs embedding counts.
 if __name__ == "__main__":
     storage_dir = Path(__file__).resolve().parents[1] / "storage" / "output_texts"

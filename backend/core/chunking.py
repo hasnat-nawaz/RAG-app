@@ -21,18 +21,21 @@ HEADERS_TO_SPLIT_ON: list[tuple[str, str]] = [
 ]
 
 
-# Serialize a Document to content + metadata for the saved JSON.
-def _document_to_dict(doc: Document) -> dict:
+# Serialize a Document to source + metadata + content for the saved JSON.
+def _document_to_dict(doc: Document, source: str) -> dict:
     return {
+        "source": source,
         "metadata": doc.metadata,
-        "content": doc.page_content,    
+        "content": doc.page_content,
     }
 
 
 # Split Markdown on H1–H6; hierarchy lives in metadata, never in content.
-def chunk_markdown(text: str) -> list[dict]:
+def chunk_markdown(text: str, source: str) -> list[dict]:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("chunk_markdown expects a non-empty Markdown string.")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("chunk_markdown expects a non-empty source filename.")
 
     splitter = MarkdownHeaderTextSplitter(
         headers_to_split_on=HEADERS_TO_SPLIT_ON,
@@ -40,8 +43,12 @@ def chunk_markdown(text: str) -> list[dict]:
     )
     chunks = splitter.split_text(text)
 
-    # Drop header-only slices, then return content + metadata dicts.
-    return [_document_to_dict(chunk) for chunk in chunks if chunk.page_content.strip()]
+    # Drop header-only slices, then return source + metadata + content dicts.
+    return [
+        _document_to_dict(chunk, source)
+        for chunk in chunks
+        if chunk.page_content.strip()
+    ]
 
 
 # Local test run: load converted Markdown, chunk it, and write the objects to JSON.
@@ -60,7 +67,8 @@ if __name__ == "__main__":
 
             print(f"Chunking '{doc}' with MarkdownHeaderTextSplitter...")
             markdown_text = markdown_path.read_text(encoding="utf-8")
-            chunks = chunk_markdown(markdown_text)
+            source = f"{Path(doc).stem}.pdf"
+            chunks = chunk_markdown(markdown_text, source=source)
 
             output_file_path = output_dir / f"{Path(doc).stem}.chunks.json"
             output_file_path.write_text(
