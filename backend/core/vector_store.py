@@ -11,10 +11,12 @@ from embedding import embed_query
 from query_optimization.hypothetical_document import generate_hypothetical_document
 from query_optimization.query_expansion import expand_query
 from query_optimization.query_rewriting import rewrite_query
+from reranker import rerank
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "storage" / "lanceDB"
 DEFAULT_TABLE_NAME = "EmbeddingsTable"
+DEFAULT_TOP_K = 10
 
 
 class VectorStore:
@@ -121,7 +123,7 @@ class VectorStore:
         print("FTS index ready.")
 
     # Exact KNN over all rows (no ANN index). Cosine distance, closest `top_k` vectors.
-    def sequential_search(self, query_vector: list[float], top_k: int = 5) -> list[dict]:
+    def sequential_search(self, query_vector: list[float], top_k: int = DEFAULT_TOP_K) -> list[dict]:
         if self.table is None:
             raise RuntimeError("No table yet. Call add() before sequential_search().")
         if not query_vector:
@@ -137,7 +139,7 @@ class VectorStore:
         )
 
     # BM25 keyword search over chunk content.
-    def bm25(self, query: str, top_k: int = 5) -> list[dict]:
+    def bm25(self, query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
         if self.table is None:
             raise RuntimeError("No table yet. Call add() before bm25().")
         if not isinstance(query, str) or not query.strip():
@@ -155,7 +157,7 @@ class VectorStore:
         )
 
     # HyDE: generate a hypothetical doc, embed it, then run semantic search.
-    def hyde(self, query: str, top_k: int = 5) -> list[dict]:
+    def hyde(self, query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("hyde expects a non-empty query string.")
         if top_k < 1:
@@ -172,10 +174,10 @@ if __name__ == "__main__":
 
     storage_dir = Path(__file__).resolve().parents[1] / "storage"
     output_path = storage_dir / "outputs.txt"
-    top_k = 5
+    top_k = DEFAULT_TOP_K
 
     # Edit this query to test retrieval.
-    query = "Bro, what's the deal with these QR codes we gotta scan while flying? Like, what kind of instructions are actually on them, how massive are these codes on the ground, and what's the protocol if our drone's camera just straight up fails to read it?"
+    query = "What's the exact procedure for the semi-autonomous fleet control task? Like, how does the swarm move, what maneuvers can they actually perform in manoeuvre mode versus herd mode, and what are the specific rules and instructions the referees or pilot give using the controller during this?"
 
     def _format_hits(hits: list[dict]) -> str:
         lines = []
@@ -188,6 +190,8 @@ if __name__ == "__main__":
                 lines.append(f"      distance={hit['_distance']}")
             if "_score" in hit:
                 lines.append(f"      score={hit['_score']}")
+            if "rerank_score" in hit:
+                lines.append(f"      rerank_score={hit['rerank_score']}")
         return "\n".join(lines) if lines else "  (no results)"
 
     try:
@@ -244,6 +248,20 @@ if __name__ == "__main__":
         sections.append("=== HYDE → SEQUENTIAL ===")
         sections.append(f"Hypothetical document:\n{hypothetical_doc}\n")
         sections.append(f"Results:\n{_format_hits(hyde_hits)}\n")
+
+        # 4) Merge all paths → rerank (10–30 docs depending on overlap)
+        print("\n=== MERGE → RERANK ===")
+        t_path = time.perf_counter()
+        merged_hits = rewrite_hits + bm25_hits + hyde_hits
+        print(f"  merged: {len(merged_hits)} doc(s) from 3 retrievers")
+        t0 = time.perf_counter()
+        reranked_hits = rerank(query, merged_hits)
+        print(f"  rerank: {time.perf_counter() - t0:.3f}s")
+        print(f"  top {len(reranked_hits)}: {len(reranked_hits)}/{len(merged_hits)} doc(s)")
+        print(f"  total: {time.perf_counter() - t_path:.3f}s")
+        sections.append("=== MERGE → RERANK ===")
+        sections.append(f"Merged: {len(merged_hits)} | Top reranked: {len(reranked_hits)}\n")
+        sections.append(f"Results:\n{_format_hits(reranked_hits)}\n")
 
         output_path.write_text("\n".join(sections), encoding="utf-8")
         print(f"Saved results to: {output_path}")
