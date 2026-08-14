@@ -13,7 +13,6 @@ OUTPUT_DIMENSIONALITY = 768
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 15
 REQUEST_DELAY_SECONDS = 1
-WARMUP_TEXT = "warmup"
 
 _embedder: "Embedder | None" = None
 
@@ -21,16 +20,6 @@ _embedder: "Embedder | None" = None
 class Embedder:
     def __init__(self) -> None:
         self.client = get_client()
-        self.warmup()
-
-    def warmup(self) -> bool:
-        print("warming up embedding connection...")
-        warmup_start = time.perf_counter()
-        vectors = self._embed_batch([WARMUP_TEXT], "warmup")
-        print(f"embedding warmup time taken = {time.perf_counter() - warmup_start:.1f}s")
-        if not vectors or not vectors[0]:
-            raise RuntimeError("Embedding warmup returned an empty vector.")
-        return True
 
     def _as_embed_contents(self, texts: list[str]) -> list[types.Content]:
         return [types.Content(parts=[types.Part(text=text)]) for text in texts]

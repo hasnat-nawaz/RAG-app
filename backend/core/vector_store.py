@@ -22,30 +22,18 @@ DEFAULT_TABLE_NAME = "EmbeddingsTable"
 _store: "VectorStore | None" = None
 
 
-def get_vector_store(
-    db_path: str | Path = DEFAULT_DB_PATH,
-    table_name: str = DEFAULT_TABLE_NAME,
-) -> "VectorStore":
-    global _store
-    resolved = Path(db_path)
-    if (
-        _store is None
-        or _store.db_path != resolved
-        or _store.table_name != table_name
-    ):
-        _store = VectorStore(db_path=resolved, table_name=table_name)
-    return _store
-
-
 class VectorStore:
     def __init__(
         self,
         db_path: str | Path = DEFAULT_DB_PATH,
         table_name: str = DEFAULT_TABLE_NAME,
+        *,
+        embedder=None,
     ) -> None:
         self.db_path = Path(db_path)
         self.db_path.mkdir(parents=True, exist_ok=True)
         self.table_name = table_name
+        self.embedder = embedder or get_embedder()
         self.db = lancedb.connect(self.db_path)
         self.table = self._open_table_if_exists()
         self._fts_index_ready: bool | None = None
@@ -62,9 +50,11 @@ class VectorStore:
         self._fts_index_ready = None
 
     def _next_id(self) -> int:
-        if self.table is None:
+        if self.table is None or self.table.count_rows() == 0:
             return 1
-        return self.table.count_rows() + 1
+        # count_rows()+1 collides after deletes; always allocate past max(id).
+        max_id = int(self.table.to_pandas()["id"].max())
+        return max_id + 1
 
     def add(self, chunks: list[dict], embeddings: list[list[float]]) -> int:
         payload = AddRecordsInput(chunks=chunks, embeddings=embeddings)
@@ -152,5 +142,28 @@ class VectorStore:
     def hyde(self, query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
         payload = KeywordSearchInput(query=query, top_k=top_k)
         hypothetical_doc = generate_hypothetical_document(payload.query)
-        query_vector = get_embedder().embed_query(hypothetical_doc)
+        query_vector = self.embedder.embed_query(hypothetical_doc)
         return self.sequential_search(query_vector, top_k=payload.top_k)
+
+
+def get_vector_store(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    table_name: str = DEFAULT_TABLE_NAME,
+    *,
+    embedder=None,
+) -> VectorStore:
+    global _store
+    resolved = Path(db_path)
+    if (
+        _store is None
+        or _store.db_path != resolved
+        or _store.table_name != table_name
+    ):
+        _store = VectorStore(
+            db_path=resolved,
+            table_name=table_name,
+            embedder=embedder,
+        )
+    elif embedder is not None:
+        _store.embedder = embedder
+    return _store

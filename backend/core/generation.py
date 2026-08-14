@@ -1,7 +1,6 @@
 import bootstrap  # noqa: F401
 
 import json
-import time
 
 from google.genai import types
 
@@ -61,32 +60,12 @@ of documents to search through.
 - Be concise. Do not pad the answer with restated question text or filler.
 """
 
-WARMUP_PROMPT = "Reply with the single word: ok."
-
 _generator: "Generator | None" = None
 
 
 class Generator:
     def __init__(self) -> None:
         self.client = get_client()
-        self.warmup()
-
-    def warmup(self) -> bool:
-        print("warming up llm connection...")
-        warmup_start = time.perf_counter()
-        response = self.client.models.generate_content(
-            model=GENERATION_MODEL,
-            contents=WARMUP_PROMPT,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                max_output_tokens=8,
-            ),
-        )
-        ready = bool((response.text or "").strip())
-        print(f"llm warmup time taken = {time.perf_counter() - warmup_start:.1f}s")
-        if not ready:
-            raise RuntimeError("LLM warmup returned an empty response.")
-        return True
 
     def _format_documents(self, payload: GenerationInput) -> str:
         blocks: list[str] = []
@@ -118,8 +97,10 @@ class Generator:
                 max_output_tokens=2048,
             ),
         )
-        output = GenerationOutput(answer=(response.text or "").strip())
-        return output.answer
+        answer = (response.text or "").strip()
+        if not answer:
+            raise RuntimeError("LLM returned an empty response.")
+        return GenerationOutput(answer=answer).answer
 
 
 def get_generator() -> Generator:
