@@ -1,14 +1,11 @@
 """Expand user queries with extra keywords for BM25 / full-text search."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bootstrap  # noqa: F401
 
 from google.genai import types
 
 from llm_client import get_client
+from query_optimization.common import fallback_to_original, with_user_input_tags
 
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -70,16 +67,11 @@ def expand_query(query: str) -> str:
     client = get_client()
     response = client.models.generate_content(
         model=MODEL_NAME,
-        contents=f"{EXPANSION_PROMPT}\n\nUser query:\n{query.strip()}",
+        contents=f"{EXPANSION_PROMPT}\n\n{with_user_input_tags(query)}",
         config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=256),
     )
     expanded = _clean_llm_output(response.text or "")
     if not expanded:
         raise RuntimeError("Query expansion returned an empty response.")
-    return expanded
+    return fallback_to_original(query, expanded)
 
-
-if __name__ == "__main__":
-    query = "how many drones minimum should be used for the tasks"
-    print(f"Original: {query}")
-    print(f"Expanded: {expand_query(query)}")

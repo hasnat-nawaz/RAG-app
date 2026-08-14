@@ -1,6 +1,30 @@
 """Cross-encoder reranking for retrieved RAG documents."""
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import bootstrap  # noqa: F401
+
+import logging
+import os
+import threading
+import warnings
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+
+# Silence Hugging Face download / weight-loading noise before importing the model stack.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF Hub.*")
 
 from sentence_transformers import CrossEncoder
 
@@ -8,14 +32,47 @@ MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L6-v2"
 TOP_K = 10
 
 _model: CrossEncoder | None = None
+_warmup_thread: threading.Thread | None = None
+
+
+def _hub_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
 
 def _get_model() -> CrossEncoder:
-    # Lazy-load the cross-encoder so the model is only downloaded once.
+    # Lazy-load the cross-encoder so weights are only read from disk once per process.
     global _model
     if _model is None:
-        _model = CrossEncoder(MODEL_NAME)
+        token = _hub_token()
+        kwargs = {"token": token} if token else {}
+        try:
+            _model = CrossEncoder(MODEL_NAME, local_files_only=True, **kwargs)
+        except (OSError, ValueError):
+            _model = CrossEncoder(MODEL_NAME, **kwargs)
     return _model
+
+
+def warmup_reranker() -> None:
+    # Load weights and run one dummy pair so the first real rerank is inference-only.
+    model = _get_model()
+    model.predict([("warmup query", "warmup document")], show_progress_bar=False)
+
+
+def start_reranker_warmup() -> threading.Thread:
+    # Start loading the cross-encoder on a background thread (e.g. during retrieval).
+    global _warmup_thread
+    if _model is not None:
+        return threading.Thread()
+    if _warmup_thread is not None and _warmup_thread.is_alive():
+        return _warmup_thread
+    _warmup_thread = threading.Thread(target=warmup_reranker, daemon=True)
+    _warmup_thread.start()
+    return _warmup_thread
+
+
+def wait_for_reranker_warmup() -> None:
+    if _warmup_thread is not None and _warmup_thread.is_alive():
+        _warmup_thread.join()
 
 
 def _dedupe_documents(documents: list[dict]) -> list[dict]:
@@ -53,11 +110,11 @@ def rerank(
     if top_k < 1:
         raise ValueError("top_k must be at least 1.")
 
+    wait_for_reranker_warmup()
     unique_docs = _dedupe_documents(documents)
 
-    # Score every query–document pair with the cross-encoder.
     pairs = [(query.strip(), _extract_content(doc, content_key)) for doc in unique_docs]
-    raw_scores = _get_model().predict(pairs)
+    raw_scores = _get_model().predict(pairs, show_progress_bar=False, batch_size=64)
 
     scored_docs = [
         {**doc, "rerank_score": float(score)}

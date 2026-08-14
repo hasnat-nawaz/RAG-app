@@ -1,14 +1,11 @@
 """Rewrite user queries for semantic / embedding search."""
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bootstrap  # noqa: F401
 
 from google.genai import types
 
 from llm_client import get_client
+from query_optimization.common import fallback_to_original, with_user_input_tags
 
 
 MODEL_NAME = "gemini-3.5-flash-lite"
@@ -69,16 +66,11 @@ def rewrite_query(query: str) -> str:
     client = get_client()
     response = client.models.generate_content(
         model=MODEL_NAME,
-        contents=f"{REWRITE_PROMPT}\n\nUser query:\n{query.strip()}",
+        contents=f"{REWRITE_PROMPT}\n\n{with_user_input_tags(query)}",
         config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=256),
     )
     rewritten = _clean_llm_output(response.text or "")
     if not rewritten:
         raise RuntimeError("Query rewriting returned an empty response.")
-    return rewritten
+    return fallback_to_original(query, rewritten)
 
-
-if __name__ == "__main__":
-    query = "how many of those drones minimum should be used for them tasks my man"
-    print(f"Original: {query}")
-    print(f"Rewritten: {rewrite_query(query)}")
