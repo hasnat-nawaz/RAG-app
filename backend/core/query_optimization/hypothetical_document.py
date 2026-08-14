@@ -1,17 +1,15 @@
-"""HyDE: generate a hypothetical document from a user query."""
-
 import bootstrap  # noqa: F401
 
 from google.genai import types
 
-from llm_client import get_client
+from llm_client import GENERATION_MODEL, get_client
+from models.schemas import HypotheticalDocument, QueryInput
 from query_optimization.common import (
     MIN_HYPOTHETICAL_DOC_CHARS,
+    clean_llm_output,
     is_no_query,
     with_user_input_tags,
 )
-
-MODEL_NAME = "gemini-3.5-flash-lite"
 
 HYPOTHETICAL_DOC_PROMPT = """\
 You write a single hypothetical passage for HyDE-style semantic retrieval: a short excerpt that \
@@ -83,48 +81,34 @@ Question:
 """
 
 
-def _clean_llm_output(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("```markdown"):
-        cleaned = cleaned.removeprefix("```markdown").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```").strip()
-    if cleaned.endswith("```"):
-        cleaned = cleaned.removesuffix("```").strip()
-    return cleaned
-
-
 def _is_usable_document(text: str) -> bool:
     return bool(text) and not is_no_query(text) and len(text) >= MIN_HYPOTHETICAL_DOC_CHARS
 
 
-def _generate_fallback_document(client, query: str) -> str:
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=FALLBACK_HYPOTHETICAL_DOC_PROMPT.format(query=query.strip()),
+def _generate_fallback_document(query: str) -> str:
+    response = get_client().models.generate_content(
+        model=GENERATION_MODEL,
+        contents=FALLBACK_HYPOTHETICAL_DOC_PROMPT.format(query=query),
         config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512),
     )
-    return _clean_llm_output(response.text or "")
+    return clean_llm_output(response.text or "")
 
 
 def generate_hypothetical_document(query: str) -> str:
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("generate_hypothetical_document expects a non-empty query string.")
-
-    client = get_client()
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=f"{HYPOTHETICAL_DOC_PROMPT}\n\n{with_user_input_tags(query)}",
+    payload = QueryInput(query=query)
+    response = get_client().models.generate_content(
+        model=GENERATION_MODEL,
+        contents=f"{HYPOTHETICAL_DOC_PROMPT}\n\n{with_user_input_tags(payload.query)}",
         config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512),
     )
-    document = _clean_llm_output(response.text or "")
+    document = clean_llm_output(response.text or "")
 
     if not _is_usable_document(document):
-        document = _generate_fallback_document(client, query)
+        document = _generate_fallback_document(payload.query)
 
     if not _is_usable_document(document):
         raise RuntimeError(
             "Hypothetical document generation failed: model returned NO_QUERY or an unusably "
             "short passage. Check the query or retry."
         )
-    return document
+    return HypotheticalDocument(query=payload.query, document=document).document

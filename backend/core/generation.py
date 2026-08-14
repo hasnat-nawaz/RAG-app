@@ -1,14 +1,12 @@
-"""LLM response generation from retrieved RAG documents."""
+import bootstrap  # noqa: F401
 
 import json
-
-import bootstrap  # noqa: F401
+import time
 
 from google.genai import types
 
-from llm_client import get_client
-
-MODEL_NAME = "gemini-3.5-flash-lite"
+from llm_client import GENERATION_MODEL, get_client
+from models.schemas import GenerationInput, GenerationOutput
 
 INSUFFICIENT_CONTEXT_MESSAGE = (
     "The provided documents do not contain enough information to answer this question."
@@ -63,61 +61,69 @@ of documents to search through.
 - Be concise. Do not pad the answer with restated question text or filler.
 """
 
+WARMUP_PROMPT = "Reply with the single word: ok."
 
-# Build a numbered context block from retrieved chunk dicts.
-def _format_documents(documents: list[dict]) -> str:
-    blocks: list[str] = []
-    for i, doc in enumerate(documents, start=1):
-        source = doc.get("source", "unknown")
-        metadata = doc.get("metadata", {})
-        content = doc.get("content", "")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError(f"Document [{i}] is missing non-empty 'content'.")
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError(f"Document [{i}] is missing non-empty 'source'.")
+_generator: "Generator | None" = None
 
-        metadata_str = json.dumps(metadata, ensure_ascii=False) if metadata else "{}"
-        blocks.append(
-            f"[Document {i}]\n"
-            f"Source: {source.strip()}\n"
-            f"Metadata: {metadata_str}\n"
-            f"Content:\n<doc_content>\n{content.strip()}\n</doc_content>"
+
+class Generator:
+    def __init__(self) -> None:
+        self.client = get_client()
+        self.warmup()
+
+    def warmup(self) -> bool:
+        print("warming up llm connection...")
+        warmup_start = time.perf_counter()
+        response = self.client.models.generate_content(
+            model=GENERATION_MODEL,
+            contents=WARMUP_PROMPT,
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=8,
+            ),
         )
-    return "\n\n".join(blocks)
+        ready = bool((response.text or "").strip())
+        print(f"llm warmup time taken = {time.perf_counter() - warmup_start:.1f}s")
+        if not ready:
+            raise RuntimeError("LLM warmup returned an empty response.")
+        return True
+
+    def _format_documents(self, payload: GenerationInput) -> str:
+        blocks: list[str] = []
+        for i, doc in enumerate(payload.documents, start=1):
+            metadata_str = (
+                json.dumps(doc.metadata, ensure_ascii=False) if doc.metadata else "{}"
+            )
+            blocks.append(
+                f"[Document {i}]\n"
+                f"Source: {doc.source}\n"
+                f"Metadata: {metadata_str}\n"
+                f"Content:\n<doc_content>\n{doc.content}\n</doc_content>"
+            )
+        return "\n\n".join(blocks)
+
+    def generate_response(self, query: str, documents: list[dict]) -> str:
+        payload = GenerationInput(query=query, documents=documents)
+        user_message = (
+            f"Question:\n{payload.query}\n\n"
+            f"Source documents:\n{self._format_documents(payload)}\n\n"
+            "Answer the question using only the source documents above, citing each factual sentence as instructed."
+        )
+        response = self.client.models.generate_content(
+            model=GENERATION_MODEL,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.1,
+                max_output_tokens=2048,
+            ),
+        )
+        output = GenerationOutput(answer=(response.text or "").strip())
+        return output.answer
 
 
-def generate_response(query: str, documents: list[dict]) -> str:
-    """Generate a final, grounded, cited answer from the query and retrieved chunks.
-
-    Callers are responsible for the "no documents retrieved at all" case upstream
-    (e.g. your reranker's score-threshold + min_k logic) -- this function still
-    requires at least one candidate document to reason over, since an empty list
-    gives the model nothing to ground on or correctly abstain from.
-    """
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("generate_response expects a non-empty query string.")
-    if not documents:
-        raise ValueError("generate_response expects at least one document.")
-
-    context = _format_documents(documents)
-    user_message = (
-        f"Question:\n{query.strip()}\n\n"
-        f"Source documents:\n{context}\n\n"
-        "Answer the question using only the source documents above, citing each factual sentence as instructed."
-    )
-
-    client = get_client()
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=user_message,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.1,
-            max_output_tokens=2048,
-        ),
-    )
-    answer = (response.text or "").strip()
-    if not answer:
-        raise RuntimeError("Generation returned an empty response.")
-
-    return answer
+def get_generator() -> Generator:
+    global _generator
+    if _generator is None:
+        _generator = Generator()
+    return _generator

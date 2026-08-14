@@ -1,14 +1,14 @@
-"""Expand user queries with extra keywords for BM25 / full-text search."""
-
 import bootstrap  # noqa: F401
 
 from google.genai import types
 
-from llm_client import get_client
-from query_optimization.common import fallback_to_original, with_user_input_tags
-
-
-MODEL_NAME = "gemini-3.5-flash-lite"
+from llm_client import GENERATION_MODEL, get_client
+from models.schemas import OptimizedQuery, QueryInput
+from query_optimization.common import (
+    clean_llm_output,
+    fallback_to_original,
+    with_user_input_tags,
+)
 
 EXPANSION_PROMPT = """\
 You expand user input into a keyword string optimized for BM25 lexical retrieval over technical \
@@ -50,28 +50,15 @@ Output: retrieval augmented generation RAG fine-tuning model training chatbot la
 """
 
 
-def _clean_llm_output(text: str) -> str:
-    cleaned = text.strip().strip('"').strip("'")
-    if cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```").strip()
-        if cleaned.lower().startswith("text"):
-            cleaned = cleaned[4:].strip()
-        cleaned = cleaned.removesuffix("```").strip()
-    return cleaned
-
-
 def expand_query(query: str) -> str:
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("expand_query expects a non-empty query string.")
-
-    client = get_client()
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=f"{EXPANSION_PROMPT}\n\n{with_user_input_tags(query)}",
+    payload = QueryInput(query=query)
+    response = get_client().models.generate_content(
+        model=GENERATION_MODEL,
+        contents=f"{EXPANSION_PROMPT}\n\n{with_user_input_tags(payload.query)}",
         config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=256),
     )
-    expanded = _clean_llm_output(response.text or "")
-    if not expanded:
-        raise RuntimeError("Query expansion returned an empty response.")
-    return fallback_to_original(query, expanded)
-
+    optimized = fallback_to_original(
+        payload.query,
+        clean_llm_output(response.text or ""),
+    )
+    return OptimizedQuery(original=payload.query, optimized=optimized).optimized

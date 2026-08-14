@@ -1,24 +1,26 @@
-"""Central Gemini API client for the RAG pipeline."""
+import bootstrap  # noqa: F401
 
 import os
-from pathlib import Path
+import threading
 
-from dotenv import load_dotenv
 from google import genai
 
-ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
+GENERATION_MODEL = "gemini-3.5-flash-lite"
+EMBEDDING_MODEL = "gemini-embedding-2"
 
 _client: genai.Client | None = None
+_client_lock = threading.Lock()
 
 
 def get_client() -> genai.Client:
     global _client
     if _client is None:
-        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise EnvironmentError(
-                "No API key found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment."
-            )
-        _client = genai.Client(api_key=api_key)
+        with _client_lock:
+            if _client is None:
+                api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if not api_key:
+                    raise EnvironmentError(
+                        "No API key found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment."
+                    )
+                _client = genai.Client(api_key=api_key)
     return _client

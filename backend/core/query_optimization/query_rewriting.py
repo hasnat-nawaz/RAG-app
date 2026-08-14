@@ -1,14 +1,14 @@
-"""Rewrite user queries for semantic / embedding search."""
-
 import bootstrap  # noqa: F401
 
 from google.genai import types
 
-from llm_client import get_client
-from query_optimization.common import fallback_to_original, with_user_input_tags
-
-
-MODEL_NAME = "gemini-3.5-flash-lite"
+from llm_client import GENERATION_MODEL, get_client
+from models.schemas import OptimizedQuery, QueryInput
+from query_optimization.common import (
+    clean_llm_output,
+    fallback_to_original,
+    with_user_input_tags,
+)
 
 REWRITE_PROMPT = """\
 You rewrite user input into a single, clean query optimized for dense (semantic) vector retrieval.
@@ -49,28 +49,16 @@ Output: NO_QUERY
 Output: What is the refund policy?
 """
 
-def _clean_llm_output(text: str) -> str:
-    cleaned = text.strip().strip('"').strip("'")
-    if cleaned.startswith("```"):
-        cleaned = cleaned.removeprefix("```").strip()
-        if cleaned.lower().startswith("text"):
-            cleaned = cleaned[4:].strip()
-        cleaned = cleaned.removesuffix("```").strip()
-    return cleaned
-
 
 def rewrite_query(query: str) -> str:
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("rewrite_query expects a non-empty query string.")
-
-    client = get_client()
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=f"{REWRITE_PROMPT}\n\n{with_user_input_tags(query)}",
+    payload = QueryInput(query=query)
+    response = get_client().models.generate_content(
+        model=GENERATION_MODEL,
+        contents=f"{REWRITE_PROMPT}\n\n{with_user_input_tags(payload.query)}",
         config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=256),
     )
-    rewritten = _clean_llm_output(response.text or "")
-    if not rewritten:
-        raise RuntimeError("Query rewriting returned an empty response.")
-    return fallback_to_original(query, rewritten)
-
+    optimized = fallback_to_original(
+        payload.query,
+        clean_llm_output(response.text or ""),
+    )
+    return OptimizedQuery(original=payload.query, optimized=optimized).optimized

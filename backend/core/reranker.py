@@ -1,22 +1,10 @@
-"""Cross-encoder reranking for retrieved RAG documents."""
-
-import sys
-
-sys.dont_write_bytecode = True
-
 import bootstrap  # noqa: F401
 
 import logging
 import os
 import threading
 import warnings
-from pathlib import Path
 
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
-
-# Silence Hugging Face download / weight-loading noise before importing the model stack.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -28,8 +16,9 @@ warnings.filterwarnings("ignore", message=".*unauthenticated requests to the HF 
 
 from sentence_transformers import CrossEncoder
 
+from models.schemas import DEFAULT_TOP_K, RerankInput, RetrievedDocument
+
 MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L6-v2"
-TOP_K = 10
 
 _model: CrossEncoder | None = None
 _warmup_thread: threading.Thread | None = None
@@ -40,7 +29,6 @@ def _hub_token() -> str | None:
 
 
 def _get_model() -> CrossEncoder:
-    # Lazy-load the cross-encoder so weights are only read from disk once per process.
     global _model
     if _model is None:
         token = _hub_token()
@@ -53,21 +41,20 @@ def _get_model() -> CrossEncoder:
 
 
 def warmup_reranker() -> None:
-    # Load weights and run one dummy pair so the first real rerank is inference-only.
-    model = _get_model()
-    model.predict([("warmup query", "warmup document")], show_progress_bar=False)
+    _get_model().predict(
+        [("warmup query", "warmup document")],
+        show_progress_bar=False,
+    )
 
 
-def start_reranker_warmup() -> threading.Thread:
-    # Start loading the cross-encoder on a background thread (e.g. during retrieval).
+def start_reranker_warmup() -> None:
     global _warmup_thread
     if _model is not None:
-        return threading.Thread()
+        return
     if _warmup_thread is not None and _warmup_thread.is_alive():
-        return _warmup_thread
+        return
     _warmup_thread = threading.Thread(target=warmup_reranker, daemon=True)
     _warmup_thread.start()
-    return _warmup_thread
 
 
 def wait_for_reranker_warmup() -> None:
@@ -75,51 +62,35 @@ def wait_for_reranker_warmup() -> None:
         _warmup_thread.join()
 
 
-def _dedupe_documents(documents: list[dict]) -> list[dict]:
-    # Drop duplicate chunks that appear across multiple retrievers (by id).
-    seen: set = set()
-    unique: list[dict] = []
+def _dedupe_documents(documents: list[RetrievedDocument]) -> list[RetrievedDocument]:
+    seen: set[int] = set()
+    unique: list[RetrievedDocument] = []
     for doc in documents:
-        key = doc.get("id")
-        if key is not None:
-            if key in seen:
+        if doc.id is not None:
+            if doc.id in seen:
                 continue
-            seen.add(key)
+            seen.add(doc.id)
         unique.append(doc)
     return unique
-
-
-def _extract_content(doc: dict, content_key: str) -> str:
-    text = doc.get(content_key)
-    if not isinstance(text, str) or not text.strip():
-        raise ValueError(f"Document is missing non-empty '{content_key}'.")
-    return text.strip()
 
 
 def rerank(
     query: str,
     documents: list[dict],
-    top_k: int = TOP_K,
-    content_key: str = "content",
+    top_k: int = DEFAULT_TOP_K,
 ) -> list[dict]:
-    """Rerank documents and return the top_k highest-scoring results."""
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("rerank expects a non-empty query string.")
-    if not documents:
+    payload = RerankInput(query=query, documents=documents, top_k=top_k)
+    if not payload.documents:
         return []
-    if top_k < 1:
-        raise ValueError("top_k must be at least 1.")
 
     wait_for_reranker_warmup()
-    unique_docs = _dedupe_documents(documents)
-
-    pairs = [(query.strip(), _extract_content(doc, content_key)) for doc in unique_docs]
+    unique_docs = _dedupe_documents(payload.documents)
+    pairs = [(payload.query, doc.content) for doc in unique_docs]
     raw_scores = _get_model().predict(pairs, show_progress_bar=False, batch_size=64)
 
     scored_docs = [
-        {**doc, "rerank_score": float(score)}
+        doc.model_copy(update={"rerank_score": float(score)})
         for doc, score in zip(unique_docs, raw_scores)
     ]
-    scored_docs.sort(key=lambda doc: doc["rerank_score"], reverse=True)
-
-    return scored_docs[:top_k]
+    scored_docs.sort(key=lambda doc: doc.rerank_score or 0.0, reverse=True)
+    return [doc.model_dump(by_alias=True) for doc in scored_docs[: payload.top_k]]
