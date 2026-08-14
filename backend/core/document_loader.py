@@ -1,4 +1,6 @@
 # Silence noisy third-party logs before those libraries are imported.
+import bootstrap  # noqa: F401
+
 import os
 import logging
 import warnings

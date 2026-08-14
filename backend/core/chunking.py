@@ -3,6 +3,8 @@
 Embeddings see only section body text. Heading hierarchy is stored in metadata.
 """
 
+import bootstrap  # noqa: F401
+
 import json
 from pathlib import Path
 

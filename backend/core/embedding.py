@@ -1,18 +1,16 @@
 """Batch embedding for RAG chunks using Gemini Embedding 2."""
 
+import bootstrap  # noqa: F401
+
 import json
-import os
 import time
 from pathlib import Path
 
-from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
 
-
-ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
-load_dotenv(dotenv_path=ENV_PATH)
+from llm_client import get_client
 
 MODEL_NAME = "gemini-embedding-2"
 DEFAULT_BATCH_SIZE = 100
@@ -21,16 +19,6 @@ OUTPUT_DIMENSIONALITY = 768
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 15
 REQUEST_DELAY_SECONDS = 1
-
-
-# Create a Gemini client from GEMINI_API_KEY / GOOGLE_API_KEY.
-def _get_client() -> genai.Client:
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "No API key found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in your environment."
-        )
-    return genai.Client(api_key=api_key)
 
 
 # Pull the text to embed out of each {content, metadata} chunk.
@@ -113,7 +101,7 @@ def embed_chunks(chunks: list[dict], batch_size: int = DEFAULT_BATCH_SIZE) -> li
         )
 
     texts = _extract_contents(chunks)
-    client = _get_client()
+    client = get_client()
     vectors: list[list[float]] = []
     total_batches = (len(texts) + batch_size - 1) // batch_size
 
@@ -148,7 +136,7 @@ def embed_query(query: str) -> list[float]:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("embed_query expects a non-empty query string.")
 
-    client = _get_client()
+    client = get_client()
     vectors = _embed_batch(client, [query], "query")
     return vectors[0]
 

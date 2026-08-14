@@ -1,12 +1,16 @@
 """LanceDB vector store for RAG chunks."""
 
-import json
+import bootstrap  # noqa: F401
+
 from pathlib import Path
 
 import lancedb
 from lancedb.index import FTS
 
 from embedding import embed_query
+from query_optimization.hypothetical_document import generate_hypothetical_document
+from query_optimization.query_expansion import expand_query
+from query_optimization.query_rewriting import rewrite_query
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "storage" / "lanceDB"
@@ -150,45 +154,99 @@ class VectorStore:
             .to_list()
         )
 
+    # HyDE: generate a hypothetical doc, embed it, then run semantic search.
+    def hyde(self, query: str, top_k: int = 5) -> list[dict]:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("hyde expects a non-empty query string.")
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1.")
 
-# Local test: load swarm chunks + embeddings and add them to the database.
+        hypothetical_doc = generate_hypothetical_document(query)
+        query_vector = embed_query(hypothetical_doc)
+        return self.sequential_search(query_vector, top_k=top_k)
+
+
+# Local test: run all retrieval paths and save results to storage/outputs.txt.
 if __name__ == "__main__":
-    storage_dir = Path(__file__).resolve().parents[1] / "storage" / "output_texts"
-    chunks_path = storage_dir / "swarm.chunks.json"
-    embeddings_path = storage_dir / "swarm.embeddings.json"
+    import time
+
+    storage_dir = Path(__file__).resolve().parents[1] / "storage"
+    output_path = storage_dir / "outputs.txt"
+    top_k = 5
+
+    # Edit this query to test retrieval.
+    query = "Bro, what's the deal with these QR codes we gotta scan while flying? Like, what kind of instructions are actually on them, how massive are these codes on the ground, and what's the protocol if our drone's camera just straight up fails to read it?"
+
+    def _format_hits(hits: list[dict]) -> str:
+        lines = []
+        for i, hit in enumerate(hits, start=1):
+            hit = {k: v for k, v in hit.items() if k != "vector"}
+            lines.append(f"  [{i}] id={hit.get('id')} source={hit.get('source')}")
+            lines.append(f"      metadata={hit.get('metadata')}")
+            lines.append(f"      content={hit.get('content', '')[:300]}...")
+            if "_distance" in hit:
+                lines.append(f"      distance={hit['_distance']}")
+            if "_score" in hit:
+                lines.append(f"      score={hit['_score']}")
+        return "\n".join(lines) if lines else "  (no results)"
 
     try:
-        if not chunks_path.is_file():
-            raise FileNotFoundError(f"Chunks file not found: {chunks_path}")
-        if not embeddings_path.is_file():
-            raise FileNotFoundError(f"Embeddings file not found: {embeddings_path}")
-
-        chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
-        embeddings = json.loads(embeddings_path.read_text(encoding="utf-8"))
-
         store = VectorStore()
-        total_rows = store.add(chunks, embeddings)
-        print(f"Chunks: {len(chunks)}")
-        print(f"Embeddings: {len(embeddings)}")
-        print(f"Total rows: {total_rows}")
-        print(f"DB path: {store.db_path}")
+        if store.table is None:
+            raise RuntimeError("No table found. Populate the database with add() first.")
 
-        query = "how many drones minimum should be used for the tasks"
+        sections: list[str] = [f"QUERY: {query}\n"]
 
-        print("\n--- BM25 ---")
-        bm25_hits = store.bm25(query, top_k=5)
-        for hit in bm25_hits:
-            hit.pop("vector", None)
-            print(hit)
+        # 1) Rewrite → sequential search
+        print("\n=== REWRITE → SEQUENTIAL ===")
+        t_path = time.perf_counter()
+        t0 = time.perf_counter()
+        rewritten = rewrite_query(query)
+        print(f"  rewrite_query: {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter()
+        rewrite_vector = embed_query(rewritten)
+        print(f"  embed_query: {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter()
+        rewrite_hits = store.sequential_search(rewrite_vector, top_k=top_k)
+        print(f"  sequential_search: {time.perf_counter() - t0:.3f}s")
+        print(f"  total: {time.perf_counter() - t_path:.3f}s")
+        sections.append("=== REWRITE → SEQUENTIAL ===")
+        sections.append(f"Optimized query:\n{rewritten}\n")
+        sections.append(f"Results:\n{_format_hits(rewrite_hits)}\n")
 
-        print("\n--- Sequential search ---")
-        query_vector = embed_query(query)
-        knn_hits = store.sequential_search(query_vector, top_k=5)
-        for hit in knn_hits:
-            hit.pop("vector", None)
-            print(hit)
+        # 2) Expansion → BM25
+        print("\n=== EXPANSION → BM25 ===")
+        t_path = time.perf_counter()
+        t0 = time.perf_counter()
+        expanded = expand_query(query)
+        print(f"  expand_query: {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter()
+        bm25_hits = store.bm25(expanded, top_k=top_k)
+        print(f"  bm25: {time.perf_counter() - t0:.3f}s")
+        print(f"  total: {time.perf_counter() - t_path:.3f}s")
+        sections.append("=== EXPANSION → BM25 ===")
+        sections.append(f"Optimized query:\n{expanded}\n")
+        sections.append(f"Results:\n{_format_hits(bm25_hits)}\n")
 
-    except FileNotFoundError as e:
-        print(f"\nError: {e}")
+        # 3) HyDE → sequential search
+        print("\n=== HYDE → SEQUENTIAL ===")
+        t_path = time.perf_counter()
+        t0 = time.perf_counter()
+        hypothetical_doc = generate_hypothetical_document(query)
+        print(f"  generate_hypothetical_document: {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter()
+        hyde_vector = embed_query(hypothetical_doc)
+        print(f"  embed_query: {time.perf_counter() - t0:.3f}s")
+        t0 = time.perf_counter()
+        hyde_hits = store.sequential_search(hyde_vector, top_k=top_k)
+        print(f"  sequential_search: {time.perf_counter() - t0:.3f}s")
+        print(f"  total: {time.perf_counter() - t_path:.3f}s")
+        sections.append("=== HYDE → SEQUENTIAL ===")
+        sections.append(f"Hypothetical document:\n{hypothetical_doc}\n")
+        sections.append(f"Results:\n{_format_hits(hyde_hits)}\n")
+
+        output_path.write_text("\n".join(sections), encoding="utf-8")
+        print(f"Saved results to: {output_path}")
+
     except Exception as e:
-        print(f"\nUnexpected error: {e}")
+        print(f"\nError: {e}")
