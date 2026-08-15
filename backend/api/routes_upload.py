@@ -83,7 +83,13 @@ async def upload(request: Request, file: UploadFile = File(...)) -> dict:
     upload_elapsed = time.perf_counter() - start
     print(f"Upload done: {dest.name} ({len(content)} bytes) in {upload_elapsed:.3f}s")
 
-    ingest = await _ingest(request, dest)
+    try:
+        ingest = await _ingest(request, dest)
+    except Exception:
+        # Failed ingest leaves orphans that block retries via already_present.
+        dest.unlink(missing_ok=True)
+        (MARKDOWN_DIR / f"{dest.stem}.md").unlink(missing_ok=True)
+        raise
 
     return {
         "filename": dest.name,

@@ -6,9 +6,10 @@ import threading
 from google import genai
 
 GENERATION_MODEL = "gemini-3.5-flash"
-EMBEDDING_MODEL = "gemini-embedding-2"  
+EMBEDDING_MODEL = "gemini-embedding-2"   
 PDF_PARSER_MODEL = "gemini-3.5-flash-lite"
- 
+HYDE_GENERATION_MODEL = "gemini-3.5-flash-lite"
+
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
 

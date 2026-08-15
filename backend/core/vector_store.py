@@ -49,17 +49,27 @@ class VectorStore:
 
     def reset_table(self) -> None:
         with self._write_lock:
-            if self.table_name in self.db.list_tables().tables:
-                self.db.drop_table(self.table_name)
-            self.table = None
-            self._fts_index_ready = None
+            self._drop_table_unlocked()
+
+    def _drop_table_unlocked(self) -> None:
+        if self.table_name in self.db.list_tables().tables:
+            self.db.drop_table(self.table_name)
+        self.table = None
+        self._fts_index_ready = None
 
     def _next_id(self) -> int:
-        if self.table is None or self.table.count_rows() == 0:
+        if self.table is None:
             return 1
-        # count_rows()+1 collides after deletes; always allocate past max(id).
-        max_id = int(self.table.to_pandas()["id"].max())
-        return max_id + 1
+        try:
+            if self.table.count_rows() == 0:
+                return 1
+            # count_rows()+1 collides after deletes; always allocate past max(id).
+            max_id = int(self.table.to_pandas()["id"].max())
+            return max_id + 1
+        except Exception as exc:
+            print(f"Vector store unreadable while allocating ids ({exc}); resetting table.")
+            self._drop_table_unlocked()
+            return 1
 
     @staticmethod
     def _strip_embedding_text(chunk: dict) -> dict:
@@ -91,10 +101,15 @@ class VectorStore:
                 )
             ]
 
-            if self.table is None:
+            try:
+                if self.table is None:
+                    self.table = self.db.create_table(self.table_name, data=rows)
+                else:
+                    self.table.add(rows)
+            except Exception as exc:
+                print(f"Vector store write failed ({exc}); recreating table.")
+                self._drop_table_unlocked()
                 self.table = self.db.create_table(self.table_name, data=rows)
-            else:
-                self.table.add(rows)
 
             self._update_fts_index()
             return len(rows)

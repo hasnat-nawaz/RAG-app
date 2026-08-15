@@ -2,7 +2,7 @@ import bootstrap  # noqa: F401
 
 from google.genai import types
 
-from llm_client import GENERATION_MODEL, get_client
+from llm_client import HYDE_GENERATION_MODEL, get_client
 from models.schemas import HypotheticalDocument, QueryInput
 from query_optimization.common import (
     MIN_HYPOTHETICAL_DOC_CHARS,
@@ -87,7 +87,7 @@ def _is_usable_document(text: str) -> bool:
 
 def _generate_fallback_document(query: str) -> str:
     response = get_client().models.generate_content(
-        model=GENERATION_MODEL,
+        model=HYDE_GENERATION_MODEL,
         contents=FALLBACK_HYPOTHETICAL_DOC_PROMPT.format(query=query),
         config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512),
     )
@@ -97,7 +97,7 @@ def _generate_fallback_document(query: str) -> str:
 def generate_hypothetical_document(query: str) -> str:
     payload = QueryInput(query=query)
     response = get_client().models.generate_content(
-        model=GENERATION_MODEL,
+        model=HYDE_GENERATION_MODEL,
         contents=f"{HYPOTHETICAL_DOC_PROMPT}\n\n{with_user_input_tags(payload.query)}",
         config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512),
     )
