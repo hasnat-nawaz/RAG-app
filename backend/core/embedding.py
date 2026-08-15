@@ -73,7 +73,7 @@ class Embedder:
         batch_size: int = DEFAULT_BATCH_SIZE,
     ) -> list[list[float]]:
         payload = EmbedChunksInput(chunks=chunks, batch_size=batch_size)
-        texts = [chunk.content for chunk in payload.chunks]
+        texts = [chunk.embedding_text for chunk in payload.chunks]
         vectors: list[list[float]] = []
         total_batches = (len(texts) + payload.batch_size - 1) // payload.batch_size
 

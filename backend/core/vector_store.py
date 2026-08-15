@@ -1,6 +1,8 @@
 import bootstrap  # noqa: F401
 
+import asyncio
 from pathlib import Path
+from threading import Lock
 
 import lancedb
 from lancedb.index import FTS
@@ -9,6 +11,7 @@ from embedding import get_embedder
 from models.schemas import (
     AddRecordsInput,
     DEFAULT_TOP_K,
+    HybridSearchInput,
     KeywordSearchInput,
     RetrievedDocument,
     VectorRecord,
@@ -37,6 +40,7 @@ class VectorStore:
         self.db = lancedb.connect(self.db_path)
         self.table = self._open_table_if_exists()
         self._fts_index_ready: bool | None = None
+        self._write_lock = Lock()
 
     def _open_table_if_exists(self):
         if self.table_name in self.db.list_tables().tables:
@@ -44,10 +48,11 @@ class VectorStore:
         return None
 
     def reset_table(self) -> None:
-        if self.table_name in self.db.list_tables().tables:
-            self.db.drop_table(self.table_name)
-        self.table = None
-        self._fts_index_ready = None
+        with self._write_lock:
+            if self.table_name in self.db.list_tables().tables:
+                self.db.drop_table(self.table_name)
+            self.table = None
+            self._fts_index_ready = None
 
     def _next_id(self) -> int:
         if self.table is None or self.table.count_rows() == 0:
@@ -56,29 +61,43 @@ class VectorStore:
         max_id = int(self.table.to_pandas()["id"].max())
         return max_id + 1
 
+    @staticmethod
+    def _strip_embedding_text(chunk: dict) -> dict:
+        data = {k: v for k, v in chunk.items() if k != "embedding_text"}
+        metadata = dict(data.get("metadata") or {})
+        metadata.pop("embedding_text", None)
+        data["metadata"] = metadata
+        return data
+
     def add(self, chunks: list[dict], embeddings: list[list[float]]) -> int:
-        payload = AddRecordsInput(chunks=chunks, embeddings=embeddings)
-        start_id = self._next_id()
-        rows = [
-            VectorRecord(
-                id=row_id,
-                source=chunk.source,
-                content=chunk.content,
-                metadata=chunk.metadata,
-                vector=embedding,
-            ).model_dump()
-            for row_id, (chunk, embedding) in enumerate(
-                zip(payload.chunks, payload.embeddings), start=start_id
-            )
+        sanitized = [
+            self._strip_embedding_text(chunk) if isinstance(chunk, dict) else chunk
+            for chunk in chunks
         ]
+        payload = AddRecordsInput(chunks=sanitized, embeddings=embeddings)
 
-        if self.table is None:
-            self.table = self.db.create_table(self.table_name, data=rows)
-        else:
-            self.table.add(rows)
+        with self._write_lock:
+            start_id = self._next_id()
+            rows = [
+                VectorRecord(
+                    id=row_id,
+                    source=chunk.source,
+                    content=chunk.content,
+                    metadata=chunk.metadata,
+                    vector=embedding,
+                ).model_dump()
+                for row_id, (chunk, embedding) in enumerate(
+                    zip(payload.chunks, payload.embeddings), start=start_id
+                )
+            ]
 
-        self._update_fts_index()
-        return self.table.count_rows()
+            if self.table is None:
+                self.table = self.db.create_table(self.table_name, data=rows)
+            else:
+                self.table.add(rows)
+
+            self._update_fts_index()
+            return len(rows)
 
     def _has_fts_index(self) -> bool:
         if self._fts_index_ready is not None:
@@ -109,6 +128,20 @@ class VectorStore:
             RetrievedDocument.model_validate(row).model_dump(by_alias=True)
             for row in rows
         ]
+
+    @staticmethod
+    def merge_documents(*doc_lists: list[dict]) -> list[dict]:
+        merged: list[dict] = []
+        seen: set[int] = set()
+        for docs in doc_lists:
+            for doc in docs:
+                doc_id = doc.get("id")
+                if doc_id is not None:
+                    if doc_id in seen:
+                        continue
+                    seen.add(doc_id)
+                merged.append(doc)
+        return merged
 
     def sequential_search(
         self,
@@ -144,6 +177,27 @@ class VectorStore:
         hypothetical_doc = generate_hypothetical_document(payload.query)
         query_vector = self.embedder.embed_query(hypothetical_doc)
         return self.sequential_search(query_vector, top_k=payload.top_k)
+
+    async def ahybrid_search(
+        self,
+        query: str,
+        top_k: int = DEFAULT_TOP_K,
+    ) -> list[dict]:
+        payload = HybridSearchInput(query=query, top_k=top_k)
+        query_vector = await asyncio.to_thread(
+            self.embedder.embed_query, payload.query
+        )
+        dense_docs, sparse_docs = await asyncio.gather(
+            asyncio.to_thread(
+                self.sequential_search, query_vector, payload.top_k
+            ),
+            asyncio.to_thread(self.bm25, payload.query, payload.top_k), 
+        )
+        return self.merge_documents(dense_docs, sparse_docs) 
+
+    async def ahyde(self, query: str, top_k: int = DEFAULT_TOP_K) -> list[dict]:
+        payload = KeywordSearchInput(query=query, top_k=top_k)
+        return await asyncio.to_thread(self.hyde, payload.query, payload.top_k)
 
 
 def get_vector_store(

@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 sys.dont_write_bytecode = True
 
-_CORE = Path(__file__).resolve().parent
-_BACKEND = _CORE.parent
+_BACKEND = Path(__file__).resolve().parent
+_CORE = _BACKEND / "core"
 _ROOT = _BACKEND.parent
 
 for path in (_BACKEND, _CORE):

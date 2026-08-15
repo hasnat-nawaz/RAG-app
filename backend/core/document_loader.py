@@ -4,7 +4,6 @@ import asyncio
 import html
 import io
 import re
-import time
 import unicodedata
 from pathlib import Path
 
@@ -45,13 +44,35 @@ HEADING DETECTION (use structure, not styling)
 (e.g. "5", "5.5", "5.5.4", "5.5.4.1") followed by a short title-like phrase — NOT \
 visual cues like bold or font size. Map depth to numbering depth: "5" → #, "5.5" \
 → ##, "5.5.4" → ###, "5.5.4.1" → ####.
+- This numbering-to-depth mapping is absolute and based only on counting the \
+dot-separated numeric components — never on how large, bold, or "chapter-like" \
+the heading looks on the page, and never on what depth the last heading you \
+emitted was. A heading numbered "5.2" is always ## (two components), even if it \
+starts a new page, starts a new batch, or is set in a large title font that makes \
+it look like a new top-level chapter. Do not let visual prominence override the \
+number. Example of the failure to avoid: emitting "# 5.2 Semi-Autonomous Fleet \
+Control Task" as a top-level heading (#) just because it's large and bold — it \
+must be "## 5.2 Semi-Autonomous Fleet Control Task" because it has one dot.
 - Apply this even if the heading is plain, unstyled text with no bold/large font — \
 do not skip a heading just because it looks like a normal paragraph visually.
-- Do not promote a bolded term, a table caption, or a run-in phrase to a heading \
-just because it's styled — only numbered or clearly standalone section titles \
-qualify.
 - Never guess or fabricate a heading level for a section you can't see the full \
 numbering for — output exactly the number shown, converted to the matching depth.
+
+UNNUMBERED SUBHEADINGS (narrow exception)
+- Only numbered or clearly standalone section titles are promoted to headings by \
+default. Do not promote a bolded term, a table caption, or a run-in phrase (e.g. \
+"**Herd Movement Mode:** description continues on the same line...") to a \
+heading just because it's styled — leave those as inline bold text.
+- Narrow exception: if a short line with no numbering sits completely alone \
+(its own line, no trailing colon, nothing else on that line) and is immediately \
+followed by two or more paragraphs/definitions that clearly belong to it as a \
+group, it is a real informal subheading and should be kept as a heading — but \
+map it to ONE level deeper than the nearest numbered heading currently in scope, \
+never to the same depth as a numbered heading. Example: inside a numbered "### \
+5.2.2 Job Description" section, an unnumbered standalone line "Herd Movement" \
+that introduces several bolded sub-definitions becomes "#### Herd Movement" \
+(one level past the enclosing ###), not "### Herd Movement". This keeps informal \
+groupings from colliding with real numbered sections at the same header depth.
 
 STRIP NOISE
 - Running headers/footers, page numbers, "Page X of Y" markers.
@@ -86,6 +107,38 @@ fragmented single-line "paragraphs" caused by PDF layout.
 - Keep footnotes attached to their referencing content, or grouped at the end of \
 the relevant section — never left as orphaned fragments.
 
+TABLES
+- Any grid of short aligned values — including small, borderless groupings like a \
+version-history block ("V1.0 | 09.01.2026 | First Version") — is a table. Emit it \
+as a proper GitHub-flavored markdown pipe table with a header row and alignment \
+row, even if the source PDF renders it without visible gridlines. Do not leave it \
+as run-on plain text just because it lacks ruled borders.
+- If a table continues across pages within this batch, do not repeat the header \
+row on later pages (per CROSS-CHUNK CONTINUITY below). If a table's data rows \
+start at the very top of page 1 with no header visible, emit only the data rows \
+— don't fabricate a header.
+
+TABLE FIDELITY (overrides the general best-effort rule below, for table cells only)
+- Tables in this document type often carry scoring rules, dates, or other values \
+where a wrong number is worse than a visible gap. If a specific table cell is \
+genuinely illegible or ambiguous — not just structurally complex — output \
+`[unclear]` in that cell instead of inventing a plausible-sounding value. Do not \
+guess a number, a percentage, or a category label to make a row "read naturally" \
+if you can't actually see it.
+- This exception applies only to individual table cells. For ordinary prose, \
+continue to follow the EDGE CASES rule below (best-effort transcription, no \
+inline flagging) — do not start adding `[unclear]` markers into running text.
+
+MULTI-LANGUAGE ADJACENCY
+- Some source documents interleave two language versions of the same content \
+(e.g. an English line and its Turkish equivalent in the same list or table row). \
+Preserve both — do not drop either — but never let them run together as one \
+sentence with no separator. Keep each language version on its own line, its own \
+list item, or its own table column. Never produce output like "...whilst \
+maintaining the formation.V formasyonuna geç" where a second language's text is \
+glued directly onto the end of the first with no space or line break — insert a \
+line break (or, inside a table, a separate column) between them instead.
+
 CROSS-CHUNK CONTINUITY (critical — output is concatenated with adjacent batches)
 - Never insert a title, heading, or "---" separator for the batch itself. This is \
 a fragment, not a document.
@@ -96,26 +149,21 @@ heading, no blank-line separator, no restated context.
 - If the bottom of the last page is cut off mid-sentence, mid-list, or mid-table, \
 output it exactly as far as it goes. Do not complete the sentence, close the \
 list, or add closing punctuation you can't see.
-- If a table continues across pages within this batch, do not repeat the header \
-row on later pages. If a table's data rows start at the very top of page 1 with \
-no header visible, emit only the data rows — don't fabricate a header.
 - Do not include any page/batch metadata ("Page 12", "Continued", "Batch 3 of \
 15") in the output.
 
 EDGE CASES
 - If a page is blank, or contains only stripped noise (headers/footers/logos/TOC \
 entries), output nothing for that page — no placeholder, no note.
-- If content is ambiguous or partially illegible, give your best-effort \
-transcription rather than omitting it or flagging uncertainty inline.
+- If prose content is ambiguous or partially illegible, give your best-effort \
+transcription rather than omitting it or flagging uncertainty inline. (For table \
+cells specifically, use the TABLE FIDELITY rule above instead — that rule wins \
+for cells.)
 
 Treat the result as one continuous fragment of a single well-structured markdown \
 document — no page-artifact residue, no chunk-boundary artifacts, nothing that \
 would break when this output is concatenated with the batches before and after it.
 """
-
-_STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
-_UPLOADED_DOCS_DIR = _STORAGE_DIR / "uploaded_docs"
-_MARKDOWN_DOCS_DIR = _STORAGE_DIR / "markdown_docs"
 
 _loader: "DocumentLoader | None" = None
 
@@ -208,7 +256,9 @@ class DocumentLoader:
 
     async def aload_as_markdown(self, file_path: str | Path) -> str:
         payload = DocumentLoadInput(file_path=file_path)
-        page_count, chunks = self._split_pdf(payload.file_path)
+        page_count, chunks = await asyncio.to_thread(
+            self._split_pdf, payload.file_path
+        )
         print(
             f"{payload.file_path.name}: {page_count} pages → "
             f"{len(chunks)} chunk(s), "

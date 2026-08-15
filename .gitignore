@@ -25,6 +25,10 @@ pyenv/
 Pipfile.lock
 poetry.lock
 
+# Local shell helper (venv activator)
+backend/activate
+activate
+
 # Python cache and byte-code
 __pycache__/
 *.pyc
