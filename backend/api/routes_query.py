@@ -177,15 +177,18 @@ async def query(request: Request) -> QueryResponse:
         )
         gen_seconds = time.perf_counter() - t_gen
     except Exception as exc:
-        if isinstance(exc, genai_errors.APIError):
-            code = int(exc.code) if exc.code else 502
+        api_exc = exc if isinstance(exc, genai_errors.APIError) else None
+        if api_exc is None and isinstance(getattr(exc, '__cause__', None), genai_errors.APIError):
+            api_exc = exc.__cause__
+        if api_exc is not None:
+            code = int(api_exc.code) if api_exc.code else 502
             if code < 400 or code > 599:
                 code = 502
-            message = (exc.message or "").strip() or "The model is temporarily unavailable."
+            message = (api_exc.message or "").strip() or "The model is temporarily unavailable."
             plog("query", event="generate_api_error", status=code, error=message[:160])
             raise HTTPException(
                 status_code=code,
-                detail={"message": message, "status": exc.status},
+                detail={"message": message, "status": api_exc.status},
             ) from exc
         plog("query", event="generate_error", error=str(exc)[:200])
         raise HTTPException(

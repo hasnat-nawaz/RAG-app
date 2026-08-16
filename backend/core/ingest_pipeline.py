@@ -17,6 +17,7 @@ from logutil import Timer, plog
 from models.schemas import MAX_EMBED_BATCH_SIZE
 
 EMBED_BATCH_SIZE = MAX_EMBED_BATCH_SIZE
+EMBED_PACK_PAUSE_SECONDS = 1.25
 
 
 class IngestFailed(RuntimeError):
@@ -97,6 +98,7 @@ class _DualIngestPipeline:
         self._pending: deque[dict] = deque()
         self._cond = asyncio.Condition()
         self._producer_done = False
+        self._flush_pending = False
         self._markdown_parts: list[str] = []
         self._all_chunks: list[dict] = []
         self._all_embeddings: list[list[float]] = []
@@ -309,6 +311,7 @@ class _DualIngestPipeline:
 
         async with self._cond:
             self._pending.extend(chunks)
+            self._flush_pending = True
             pending_count = len(self._pending)
             self._cond.notify_all()
 
@@ -320,6 +323,7 @@ class _DualIngestPipeline:
             chunks=len(chunks),
             avg_chars=avg_chars,
             fifo_pending=pending_count,
+            embed_flush=True,
             elapsed_s=chunk_s,
         )
 
@@ -331,8 +335,9 @@ class _DualIngestPipeline:
                 async with self._cond:
                     while True:
                         can_full = len(self._pending) >= EMBED_BATCH_SIZE
+                        can_flush = self._flush_pending and bool(self._pending)
                         can_drain = self._producer_done and bool(self._pending)
-                        if can_full or can_drain:
+                        if can_full or can_flush or can_drain:
                             break
                         if self._producer_done and not self._pending:
                             plog(
@@ -347,6 +352,13 @@ class _DualIngestPipeline:
                     take = min(EMBED_BATCH_SIZE, len(self._pending))
                     batch = [self._pending.popleft() for _ in range(take)]
                     still_pending = len(self._pending)
+                    if still_pending == 0:
+                        self._flush_pending = False
+                    reason = (
+                        "full"
+                        if take >= EMBED_BATCH_SIZE
+                        else ("flush" if not self._producer_done else "drain")
+                    )
 
                 embed_batch_index += 1
                 texts = [
@@ -363,6 +375,7 @@ class _DualIngestPipeline:
                     event="pack_start",
                     pack=embed_batch_index,
                     size=len(batch),
+                    reason=reason,
                     fifo_left=still_pending,
                     elapsed_s=self._timer.elapsed(),
                 )
@@ -392,6 +405,10 @@ class _DualIngestPipeline:
                     total_embedded=len(self._all_chunks),
                     elapsed_s=embed_s,
                 )
+                async with self._cond:
+                    more_work = bool(self._pending) or not self._producer_done
+                if more_work:
+                    await asyncio.sleep(EMBED_PACK_PAUSE_SECONDS)
         except asyncio.CancelledError:
             plog("embed", event="worker_cancelled", elapsed_s=self._timer.elapsed())
             raise

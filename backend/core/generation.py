@@ -2,6 +2,7 @@ import bootstrap
 import json
 import re
 from google.genai import types
+from gemini_retry import run_with_retries
 from llm_client import GENERATION_MODEL, get_client
 from models.schemas import GenerationInput, GenerationOutput
 INSUFFICIENT_CONTEXT_MESSAGE = 'The provided documents do not contain enough information to answer this question.'
@@ -107,10 +108,15 @@ class Generator:
     def generate_response(self, query: str, documents: list[dict]) -> str:
         payload = GenerationInput(query=query, documents=documents)
         user_message = f'Question:\n{payload.query}\n\nSource documents:\n{self._format_documents(payload)}\n\nAnswer the question using only the source documents above, citing each factual sentence as instructed.'
-        response = self.client.models.generate_content(model=GENERATION_MODEL, contents=user_message, config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.1, max_output_tokens=4096, thinking_config=types.ThinkingConfig(thinking_budget=0)))
-        answer = (response.text or '').strip()
-        if not answer:
-            raise RuntimeError('LLM returned an empty response.')
+
+        def _call() -> str:
+            response = self.client.models.generate_content(model=GENERATION_MODEL, contents=user_message, config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.1, max_output_tokens=4096, thinking_config=types.ThinkingConfig(thinking_budget=0)))
+            answer = (response.text or '').strip()
+            if not answer:
+                raise RuntimeError('LLM returned an empty response.')
+            return answer
+
+        answer = run_with_retries('generate', _call, pipeline='generate')
         return GenerationOutput(answer=_normalize_sources_section(answer)).answer
 
 def get_generator() -> Generator:

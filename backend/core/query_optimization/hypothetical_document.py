@@ -1,5 +1,6 @@
 import bootstrap
 from google.genai import types
+from gemini_retry import run_with_retries
 from llm_client import HYDE_GENERATION_MODEL, get_client
 from models.schemas import HypotheticalDocument, QueryInput
 from query_optimization.common import MIN_HYPOTHETICAL_DOC_CHARS, clean_llm_output, is_no_query, with_user_input_tags
@@ -10,13 +11,19 @@ def _is_usable_document(text: str) -> bool:
     return bool(text) and (not is_no_query(text)) and (len(text) >= MIN_HYPOTHETICAL_DOC_CHARS)
 
 def _generate_fallback_document(query: str) -> str:
-    response = get_client().models.generate_content(model=HYDE_GENERATION_MODEL, contents=FALLBACK_HYPOTHETICAL_DOC_PROMPT.format(query=query), config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512))
-    return clean_llm_output(response.text or '')
+    def _call() -> str:
+        response = get_client().models.generate_content(model=HYDE_GENERATION_MODEL, contents=FALLBACK_HYPOTHETICAL_DOC_PROMPT.format(query=query), config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512))
+        return clean_llm_output(response.text or '')
+    return run_with_retries('hyde_fallback', _call, pipeline='hyde')
 
 def generate_hypothetical_document(query: str) -> str:
     payload = QueryInput(query=query)
-    response = get_client().models.generate_content(model=HYDE_GENERATION_MODEL, contents=f'{HYPOTHETICAL_DOC_PROMPT}\n\n{with_user_input_tags(payload.query)}', config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512))
-    document = clean_llm_output(response.text or '')
+
+    def _call_primary() -> str:
+        response = get_client().models.generate_content(model=HYDE_GENERATION_MODEL, contents=f'{HYPOTHETICAL_DOC_PROMPT}\n\n{with_user_input_tags(payload.query)}', config=types.GenerateContentConfig(temperature=0.4, max_output_tokens=512))
+        return clean_llm_output(response.text or '')
+
+    document = run_with_retries('hyde', _call_primary, pipeline='hyde')
     if not _is_usable_document(document):
         document = _generate_fallback_document(payload.query)
     if not _is_usable_document(document):
