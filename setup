@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND="$ROOT/backend"
+FRONTEND="$ROOT/frontend"
+VENV="$BACKEND/.venv"
+REQS="$BACKEND/requirements.txt"
+
+info() { printf '\n==> %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+command -v npm >/dev/null 2>&1 || die "npm is required (install Node.js)"
+
+[[ -f "$REQS" ]] || die "missing $REQS"
+[[ -f "$FRONTEND/package.json" ]] || die "missing $FRONTEND/package.json"
+
+info "Python virtualenv → $VENV"
+if [[ ! -d "$VENV" ]]; then
+  python3 -m venv "$VENV"
+fi
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
+python -m pip install --upgrade pip
+pip install -r "$REQS"
+
+info "Frontend packages → $FRONTEND"
+(cd "$FRONTEND" && npm install)
+
+if [[ ! -f "$ROOT/.env" && -f "$ROOT/.env.example" ]]; then
+  info "Creating .env from .env.example"
+  cp "$ROOT/.env.example" "$ROOT/.env"
+  printf '    Fill in GEMINI_API_KEY (and HF_TOKEN if needed) in .env\n'
+fi
+
+info "Setup complete"
+printf '\nNext steps:\n'
+printf '  1. Edit .env with your API keys (if you have not already)\n'
+printf '  2. Backend:  source backend/.venv/bin/activate && cd backend && python main.py\n'
+printf '  3. Frontend: cd frontend && npm run dev\n'
+printf '\n'
