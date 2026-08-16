@@ -15,7 +15,7 @@ export default function QueryPanel({
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   };
 
   useEffect(() => {
@@ -31,7 +31,7 @@ export default function QueryPanel({
 
   return (
     <div className="query-area">
-      <div className="query-input-shell">
+      <div className="query-bar">
         <textarea
           ref={textareaRef}
           rows={1}
@@ -51,17 +51,18 @@ export default function QueryPanel({
           placeholder="Ask questions from your documents…"
           aria-label="Question"
         />
-      </div>
-      <div className="query-controls">
-        <MethodSelector hybrid={hybrid} hyde={hyde} onChange={setMethod} />
-        <button
-          className="send"
-          onClick={send}
-          type="button"
-          disabled={!value.trim() || loading || (!hybrid && !hyde)}
-        >
-          {loading ? "…" : "↑"}
-        </button>
+        <div className="query-bar-actions">
+          <MethodSelector hybrid={hybrid} hyde={hyde} onChange={setMethod} />
+          <button
+            className="send"
+            onClick={send}
+            type="button"
+            disabled={!value.trim() || loading || (!hybrid && !hyde)}
+            aria-label="Send"
+          >
+            {loading ? "…" : "↑"}
+          </button>
+        </div>
       </div>
     </div>
   );

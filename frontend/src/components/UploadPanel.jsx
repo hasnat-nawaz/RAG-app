@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { estimateUploadNotice, noticeText } from "../utils/uploadEstimate";
 
 const UPLOAD_STEPS = [
   "Processing document",
@@ -11,8 +12,10 @@ const UPLOAD_STEPS = [
 const EXPAND_MS = 960;
 const STATUS_FADE_MS = 750;
 const COLLAPSE_MS = 960;
+const NOTICE_MS = 4000;
+const STEP_MS = 4000; // 1.5s in + 1s hold + 1.5s out
 
-export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
+export default function UploadPanel({ onUpload, busy, phase }) {
   const [open, setOpen] = useState(false);
   const [file, setFile] = useState(null);
   const [drag, setDrag] = useState(false);
@@ -25,6 +28,7 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
   const ref = useRef();
   const timers = useRef([]);
   const phaseRef = useRef(phase);
+  const noticeKindRef = useRef(null);
 
   const clearTimers = () => {
     timers.current.forEach(clearTimeout);
@@ -37,6 +41,20 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
     return id;
   };
 
+  const startStepCycle = () => {
+    let index = 0;
+    setStatusKind("working");
+    setStatusText(UPLOAD_STEPS[0]);
+    setStatusKey("step-0");
+    setShowStatus(true);
+    const id = setInterval(() => {
+      index = (index + 1) % UPLOAD_STEPS.length;
+      setStatusText(UPLOAD_STEPS[index]);
+      setStatusKey(`step-${index}`);
+    }, STEP_MS);
+    timers.current.push(id);
+  };
+
   useEffect(() => {
     const previous = phaseRef.current;
     phaseRef.current = phase;
@@ -45,12 +63,21 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
     if (phase === "working") {
       setShowIdle(false);
       setShowStatus(false);
-      setStatusKind("working");
-      setStatusText(UPLOAD_STEPS[0]);
-      setStatusKey("step-0");
       setExpanded(true);
+      const notice = noticeKindRef.current;
       later(() => {
-        setShowStatus(true);
+        if (notice) {
+          setStatusKind("notice");
+          setStatusText(noticeText(notice));
+          setStatusKey(`notice-${notice}`);
+          setShowStatus(true);
+          later(() => {
+            setShowStatus(false);
+            later(() => startStepCycle(), STATUS_FADE_MS);
+          }, NOTICE_MS);
+        } else {
+          startStepCycle();
+        }
       }, EXPAND_MS);
       return clearTimers;
     }
@@ -67,12 +94,10 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
       return clearTimers;
     }
 
-    // Initial mount / already idle — nothing to animate
     if (previous == null && phase == null) {
       return clearTimers;
     }
 
-    // Return to idle: fade status → shrink → fade "Add source" in
     setShowStatus(false);
     later(() => {
       setExpanded(false);
@@ -80,18 +105,12 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
         setStatusText("");
         setStatusKind("working");
         setShowIdle(true);
+        noticeKindRef.current = null;
       }, COLLAPSE_MS);
     }, STATUS_FADE_MS);
 
     return clearTimers;
   }, [phase]);
-
-  useEffect(() => {
-    if (phase !== "working" || !showStatus) return;
-    setStatusKind("working");
-    setStatusText(UPLOAD_STEPS[stepIndex] || UPLOAD_STEPS[0]);
-    setStatusKey(`step-${stepIndex}`);
-  }, [stepIndex, phase, showStatus]);
 
   const choose = (f) => {
     if (f && !f.name.toLowerCase().endsWith(".pdf")) {
@@ -107,14 +126,21 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
     setDrag(false);
   };
 
-  const startUpload = () => {
+  const startUpload = async () => {
     if (!file || busy) return;
     const selected = file;
     close();
+    try {
+      noticeKindRef.current = await estimateUploadNotice(selected);
+    } catch {
+      noticeKindRef.current = null;
+    }
     onUpload(selected);
   };
 
   const dockBusy = Boolean(phase) || busy;
+  const showPulseRing =
+    showStatus && (statusKind === "working" || statusKind === "notice");
 
   return (
     <>
@@ -126,10 +152,22 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
           showIdle ? "idle-visible" : "",
           statusKind === "done" ? "done" : "",
           statusKind === "error" ? "error" : "",
+          statusKind === "notice" ? "notice" : "",
         ]
           .filter(Boolean)
           .join(" ")}
       >
+        {showPulseRing ? (
+          <span
+            key={statusKey}
+            className={
+              statusKind === "notice"
+                ? "upload-dock-pulse-ring notice-ring"
+                : "upload-dock-pulse-ring"
+            }
+            aria-hidden="true"
+          />
+        ) : null}
         <button
           className="upload-dock-hit"
           type="button"
@@ -145,7 +183,9 @@ export default function UploadPanel({ onUpload, busy, phase, stepIndex }) {
               <b
                 key={statusKey}
                 className={
-                  statusKind === "working" ? "process-status" : "process-result"
+                  statusKind === "working" || statusKind === "notice"
+                    ? "process-status"
+                    : "process-result"
                 }
               >
                 {statusText}

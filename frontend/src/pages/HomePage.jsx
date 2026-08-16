@@ -1,19 +1,6 @@
 export default function HomePage({ onChat }) {
   return (
-    <main className="app home-page">
-      <div className="orb" />
-      <header>
-        <div className="brand-mark">
-          <img src="/icon.png" alt="" />
-        </div>
-        <div className="brand">
-          <span>app</span>
-        </div>
-        <div className="header-status">
-          <i /> LOCAL KNOWLEDGE ENGINE
-        </div>
-      </header>
-
+    <div className="page home-page" key="home">
       <section className="hero">
         <div className="eyebrow">PRIVATE DOCUMENT INTELLIGENCE</div>
         <h1>
@@ -30,6 +17,6 @@ export default function HomePage({ onChat }) {
           <span aria-hidden="true">→</span>
         </button>
       </section>
-    </main>
+    </div>
   );
 }

@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 
 const LOADING_STEPS = [
   "Embedding query",
   "Retrieving documents",
-  "Reranking documents",
+  "Cross encoder reranking",
   "Generating response",
 ];
 
@@ -34,7 +37,18 @@ export default function ResultsPanel({ messages, loading }) {
           <span className="message-label">
             {m.role === "user" ? "YOU" : "RAG APP"}
           </span>
-          <div className="bubble">{m.content}</div>
+          {m.role === "assistant" && !m.error ? (
+            <div className="bubble markdown-body">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeSanitize]}
+              >
+                {m.content}
+              </ReactMarkdown>
+            </div>
+          ) : (
+            <div className="bubble">{m.content}</div>
+          )}
         </div>
       ))}
       {loading && (

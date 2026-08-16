@@ -3,43 +3,88 @@ import QueryPanel from "../components/QueryPanel";
 import UploadPanel from "../components/UploadPanel";
 import ResultsPanel from "../components/ResultsPanel";
 import MetricsPanel from "../components/MetricsPanel";
-import { queryRag, uploadPdf } from "../api/client";
+import { checkHealth, queryRag, uploadPdf } from "../api/client";
 
-const UPLOAD_STEPS_COUNT = 5;
+const OFFLINE_POLL_MS = 4000;
 
-export default function ChatPage({ onHome }) {
+export default function ChatPage() {
   const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(false);
   const [hybrid, setHybrid] = useState(true);
   const [hyde, setHyde] = useState(false);
   const [metrics, setMetrics] = useState(null);
+  const [statusCode, setStatusCode] = useState(null);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [uploadPhase, setUploadPhase] = useState(null);
-  const [stepIndex, setStepIndex] = useState(0);
+  const [online, setOnline] = useState(true);
 
   useEffect(() => {
-    if (uploadPhase !== "working") return;
-    setStepIndex(0);
-    const id = setInterval(() => {
-      setStepIndex((i) => (i + 1) % UPLOAD_STEPS_COUNT);
-    }, 3000);
-    return () => clearInterval(id);
-  }, [uploadPhase]);
+    if (online) return undefined;
+
+    let cancelled = false;
+
+    const poll = async () => {
+      if (typeof navigator !== "undefined" && !navigator.onLine) return;
+      const ok = await checkHealth();
+      if (!cancelled && ok) setOnline(true);
+    };
+
+    poll();
+    const id = setInterval(poll, OFFLINE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [online]);
 
   const submit = async (text) => {
     setMessages([{ role: "user", content: text }]);
     setMetrics(null);
+    setStatusCode(null);
+
+    const browserOffline =
+      typeof navigator !== "undefined" && !navigator.onLine;
+    const reachable = browserOffline ? false : await checkHealth();
+
+    if (!reachable) {
+      setOnline(false);
+      setStatusCode(0);
+      setMessages((m) => [
+        ...m,
+        {
+          role: "assistant",
+          error: true,
+          content: "Server is offline.",
+        },
+      ]);
+      return;
+    }
+
+    setOnline(true);
     setLoading(true);
     try {
       const data = await queryRag({ query: text, hybrid, hyde });
       setMessages((m) => [...m, { role: "assistant", content: data.answer }]);
       setMetrics(data);
+      setStatusCode(data.status ?? 200);
+      setOnline(true);
     } catch (e) {
+      const code = typeof e.status === "number" ? e.status : 500;
+      const unreachable = code === 0;
+      if (unreachable) setOnline(false);
+      else setOnline(true);
+      const message = unreachable
+        ? "Server is offline."
+        : e.message?.trim() ||
+          "Something went wrong while retrieving an answer. Please try again.";
+      setStatusCode(code || 500);
+      setMetrics(null);
       setMessages((m) => [
         ...m,
         {
           role: "assistant",
-          content: `Unable to retrieve an answer. ${e.message}`,
+          error: true,
+          content: message,
         },
       ]);
     } finally {
@@ -53,10 +98,12 @@ export default function ChatPage({ onHome }) {
     try {
       await uploadPdf(file);
       setUploadPhase("done");
-      setTimeout(() => setUploadPhase(null), 2400);
-    } catch {
+      setOnline(true);
+      setTimeout(() => setUploadPhase(null), 5800);
+    } catch (e) {
+      if (e?.status === 0) setOnline(false);
       setUploadPhase("error");
-      setTimeout(() => setUploadPhase(null), 2600);
+      setTimeout(() => setUploadPhase(null), 3200);
     } finally {
       setUploadBusy(false);
     }
@@ -70,29 +117,17 @@ export default function ChatPage({ onHome }) {
   };
 
   return (
-    <main className="app chat-page">
-      <div className="orb" />
-      <header>
-        <button className="brand-link" type="button" onClick={onHome}>
-          <div className="brand-mark">
-            <img src="/icon.png" alt="" />
-          </div>
-          <div className="brand">
-            <span>app</span>
-          </div>
-        </button>
-        <div className="header-status">
-          <i /> LOCAL KNOWLEDGE ENGINE
-        </div>
-      </header>
-
+    <div className="page chat-page-content" key="chat">
       <section className="chat-shell">
         <div className="chat-top">
           <span>CONVERSATION</span>
-          <span className="live-dot">● ONLINE</span>
+          <span className={`live-status ${online ? "is-online" : "is-offline"}`}>
+            <i className="live-status-dot" aria-hidden="true" />
+            {online ? "ONLINE" : "OFFLINE"}
+          </span>
         </div>
         <ResultsPanel messages={messages} loading={loading} />
-        <MetricsPanel data={metrics} />
+        <MetricsPanel data={metrics} status={statusCode} />
         <QueryPanel
           onSubmit={submit}
           loading={loading}
@@ -106,12 +141,7 @@ export default function ChatPage({ onHome }) {
         onUpload={upload}
         busy={uploadBusy}
         phase={uploadPhase}
-        stepIndex={stepIndex}
       />
-
-      <footer>
-        RAG APP <span>•</span> Built for local retrieval
-      </footer>
-    </main>
+    </div>
   );
 }

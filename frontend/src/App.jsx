@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import AppHeader from "./components/AppHeader";
 import HomePage from "./pages/HomePage";
 import ChatPage from "./pages/ChatPage";
 
@@ -9,21 +10,19 @@ function normalizePath(path) {
 
 function NotFound({ onHome }) {
   return (
-    <main className="not-found">
+    <div className="page not-found-page" key="404">
       <div className="astronaut big">◉</div>
       <div className="code">404</div>
       <p>This route drifted out of orbit.</p>
       <button className="primary" onClick={onHome}>
         Back to home
       </button>
-    </main>
+    </div>
   );
 }
 
 export default function App() {
-  const [route, setRoute] = useState(() =>
-    normalizePath(window.location.pathname),
-  );
+  const [route, setRoute] = useState("/home");
 
   const navigate = (path) => {
     const next = normalizePath(path);
@@ -36,23 +35,39 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (window.location.pathname === "/" || window.location.pathname === "") {
-      history.replaceState({}, "", "/home");
-      setRoute("/home");
-    }
+    history.replaceState({}, "", "/home");
+    setRoute("/home");
 
     const onPop = () => setRoute(normalizePath(window.location.pathname));
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
-  if (route === "/home") {
-    return <HomePage onChat={() => navigate("/chat")} />;
+  const isChat = route === "/chat";
+  const isHome = route === "/home";
+
+  let page = null;
+  if (isHome) {
+    page = <HomePage onChat={() => navigate("/chat")} />;
+  } else if (isChat) {
+    page = <ChatPage />;
+  } else {
+    page = <NotFound onHome={() => navigate("/home")} />;
   }
 
-  if (route === "/chat") {
-    return <ChatPage onHome={() => navigate("/home")} />;
-  }
-
-  return <NotFound onHome={() => navigate("/home")} />;
+  return (
+    <main
+      className={[
+        "app",
+        isChat ? "chat-page" : "",
+        isHome ? "home-page" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <div className="orb" />
+      <AppHeader onHome={() => navigate("/home")} />
+      <div className="page-stage">{page}</div>
+    </main>
+  );
 }

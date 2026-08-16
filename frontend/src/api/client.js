@@ -1,20 +1,52 @@
-/**
- * FastAPI client for the RAG backend.
- *
- * Default: same-origin requests (Vite proxies /upload and /query in dev).
- * Override with VITE_API_URL (e.g. http://127.0.0.1:8000).
- */
 const BASE_URL = import.meta.env.VITE_API_URL ?? "";
 
-async function parseError(response) {
-  let body;
-  try {
-    body = await response.json();
-  } catch {
-    body = await response.text();
+export class ApiError extends Error {
+  constructor(message, status = 500) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
   }
-  const detail = body?.detail || body?.message || body;
-  return new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+}
+
+function pickMessage(value) {
+  if (value == null || value === "") return null;
+  if (typeof value === "string") return value.trim() || null;
+  if (typeof value !== "object") return String(value);
+
+  const nested =
+    value.message ||
+    value.error?.message ||
+    value.detail?.message ||
+    (typeof value.detail === "string" ? value.detail : null);
+  if (nested) return pickMessage(nested);
+
+  if (Array.isArray(value.detail)) {
+    const parts = value.detail
+      .map((item) => pickMessage(item?.msg || item?.message || item))
+      .filter(Boolean);
+    if (parts.length) return parts.join(" ");
+  }
+
+  return null;
+}
+
+async function parseError(response) {
+  const raw = await response.text();
+  let body = null;
+  try {
+    body = raw ? JSON.parse(raw) : null;
+  } catch {
+    body = raw;
+  }
+
+  const message =
+    pickMessage(body) ||
+    pickMessage(body?.detail) ||
+    (typeof raw === "string" && raw.trim()) ||
+    response.statusText ||
+    "Request failed.";
+
+  return new ApiError(message, response.status);
 }
 
 function withTimeout(ms) {
@@ -41,7 +73,17 @@ export async function queryRag({ query, hybrid, hyde, top_k = 10 }) {
       signal: t.signal,
     });
     if (!res.ok) throw await parseError(res);
-    return await res.json();
+    const data = await res.json();
+    return { ...data, status: res.status };
+  } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err?.name === "AbortError") {
+      throw new ApiError("The request timed out. Please try again.", 408);
+    }
+    throw new ApiError(
+      err?.message || "Could not reach the RAG backend.",
+      0,
+    );
   } finally {
     t.clear();
   }
@@ -75,12 +117,35 @@ export async function uploadPdf(file, onProgress) {
         data = xhr.responseText;
       }
       if (xhr.status < 200 || xhr.status >= 300) {
-        return reject(new Error(data?.detail || "Upload failed."));
+        const message =
+          pickMessage(data) ||
+          (typeof data === "string" ? data : null) ||
+          "Upload failed.";
+        return reject(new ApiError(message, xhr.status));
       }
       resolve(data);
     };
     xhr.send(body);
   });
+}
+
+export async function checkHealth({ timeoutMs = 2500 } = {}) {
+  const t = withTimeout(timeoutMs);
+  try {
+    const res = await fetch(`${BASE_URL}/health`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: t.signal,
+      cache: "no-store",
+    });
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return data?.status === "ok";
+  } catch {
+    return false;
+  } finally {
+    t.clear();
+  }
 }
 
 export { BASE_URL };

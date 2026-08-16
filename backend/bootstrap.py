@@ -1,19 +1,14 @@
 import os
 import sys
 from pathlib import Path
-
 from dotenv import load_dotenv
-
-os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 sys.dont_write_bytecode = True
-
 _BACKEND = Path(__file__).resolve().parent
-_CORE = _BACKEND / "core"
+_CORE = _BACKEND / 'core'
 _ROOT = _BACKEND.parent
-
 for path in (_BACKEND, _CORE):
     path_str = str(path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
-
-load_dotenv(dotenv_path=_ROOT / ".env")
+load_dotenv(dotenv_path=_ROOT / '.env')

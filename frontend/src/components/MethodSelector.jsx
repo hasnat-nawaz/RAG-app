@@ -23,7 +23,18 @@ export default function MethodSelector({ hybrid, hyde, onChange }) {
         onClick={() => setOpen(!open)}
         aria-expanded={open}
       >
-        Retrieval logic <span>⌄</span>
+        Retrieval logic{" "}
+        <span className="method-chevron" aria-hidden="true">
+          <svg viewBox="0 0 12 8" width="9" height="6" fill="none">
+            <path
+              d="M1.5 1.75L6 6.25L10.5 1.75"
+              stroke="currentColor"
+              strokeWidth="1.6"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
       </button>
       {open && (
         <div className="method-pop">
