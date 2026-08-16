@@ -138,6 +138,18 @@ export default function UploadPanel({ onUpload, busy, phase }) {
     onUpload(selected);
   };
 
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKeyDown = (e) => {
+      if (e.key !== "Enter" || e.nativeEvent?.isComposing) return;
+      if (!file || busy) return;
+      e.preventDefault();
+      startUpload();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, file, busy]);
+
   const dockBusy = Boolean(phase) || busy;
   const showPulseRing =
     showStatus && (statusKind === "working" || statusKind === "notice");
