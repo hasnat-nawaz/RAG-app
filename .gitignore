@@ -45,7 +45,7 @@ Thumbs.db
 data/
 output/
 downloads/
-models/
+/models/
 storage/
 backend/storage/
 *.pdf
