@@ -34,6 +34,12 @@ if [[ ! -f "$ROOT/.env" && -f "$ROOT/.env.example" ]]; then
   printf '    Fill in GEMINI_API_KEY (and HF_TOKEN if needed) in .env\n'
 fi
 
+info "Caching local models (reranker)"
+(
+  cd "$BACKEND"
+  python warmup_models.py
+)
+
 info "Setup complete"
 printf '\nNext steps:\n'
 printf '  1. Edit .env with your API keys (if you have not already)\n'

@@ -911,19 +911,13 @@ header,
   color: #ded4ee;
   overflow: hidden;
   opacity: 0;
-  animation: pageRise 0.85s ease 0.48s forwards;
+  animation: pageRise 0.85s ease 0.48s both;
   transition:
     width 0.95s var(--dock-ease),
     height 0.95s var(--dock-ease),
     border-radius 0.95s var(--dock-ease),
     border-color 0.55s ease,
     color 0.55s ease;
-}
-
-.upload-dock.idle-visible,
-.upload-dock.expanded,
-.upload-dock.status-visible {
-  opacity: 1;
 }
 
 .upload-dock.expanded {

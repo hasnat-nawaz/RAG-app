@@ -71,6 +71,7 @@ That script will:
 2. Install Python packages from `backend/requirements.txt`
 3. Install frontend packages from `frontend/package.json`
 4. Create a `.env` file from `.env.example` if you do not already have one
+5. Download and cache the local reranker model (`cross-encoder/ms-marco-MiniLM-L6-v2`) so the first query does not wait on a Hugging Face download
 
 Then open `.env` and add your key:
 
@@ -78,6 +79,8 @@ Then open `.env` and add your key:
 GEMINI_API_KEY=your_key_here
 HF_TOKEN=your_token_here
 ```
+
+Step 5 only needs to download once. After that the model stays in your local Hugging Face cache, so later `./setup` runs (or backend starts) just reuse it. If you already filled in `HF_TOKEN` before running setup, it will be used for the download.
 
 ## Run
 
@@ -108,25 +111,35 @@ In development, Vite proxies `/upload`, `/query`, `/methods`, and `/health` to t
 ## Project layout
 
 ```text
-.
-├── setup                 # one-command install
-├── .env.example          # API key template
-├── backend/
-│   ├── main.py           # FastAPI entrypoint
-│   ├── api/              # upload + query routes
-│   ├── core/             # ingest, chunking, embed, retrieve, generate
-│   └── requirements.txt
-└── frontend/
-    ├── src/              # React UI
+rag-project/
+├── setup                 # install deps + cache the reranker model
+├── README.md
+├── .env.example          # copy to .env and add your API keys
+│
+├── backend/              # FastAPI API + RAG pipeline
+│   ├── main.py           # start the server
+│   ├── warmup_models.py  # one-time model download (used by setup)
+│   ├── requirements.txt
+│   ├── api/              # HTTP routes (upload, query)
+│   ├── core/             # ingest → chunk → embed → retrieve → generate
+│   ├── models/           # request/response schemas
+│   └── storage/          # local PDFs, markdown, LanceDB (gitignored)
+│
+└── frontend/             # React + Vite UI
+    ├── src/
+    │   ├── pages/        # home + chat
+    │   ├── components/   # upload, query, results, metrics
+    │   └── api/          # calls the backend
     └── package.json
 ```
 
-Uploaded PDFs, markdown, and the vector database live under `backend/storage/` and are ignored by git.
+Flow in short: **frontend** talks to **backend/api**, which runs the pipeline in **backend/core** and stores data in **backend/storage**.
 
 ## Notes
 
 - Only PDF uploads are supported.
 - Answers depend on what you have ingested; an empty database returns a clear empty-state message.
+- The reranker model is downloaded once during `./setup` and cached locally. The backend loads it into memory on startup.
 - Keep `.env` private. Never commit real API keys.
 
 ## Author
