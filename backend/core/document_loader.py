@@ -1,26 +1,30 @@
+"""PDF splitting and Gemini-based markdown extraction for ingest."""
+
 import bootstrap
-import asyncio
 import html
 import io
 import re
 import unicodedata
 from pathlib import Path
+
 from google.genai import types
 from pypdf import PdfReader, PdfWriter
+
 from llm_client import PDF_PARSER_MODEL, get_client
 from models.schemas import DocumentLoadInput
-_HTML_COMMENT = re.compile('<!--.*?-->', re.DOTALL)
-_TOC_LEADERS = re.compile('[.\\u2026]{4,}')
-_UNICODE_SPACE = re.compile('[\\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000]')
-_ZERO_WIDTH = re.compile('[\\u200b\\u200c\\u200d\\ufeff\\u00ad]')
-_TRAILING_WS = re.compile('[ \\t]+$', re.MULTILINE)
-_INTERNAL_MULTI_SPACE = re.compile('(?<=\\S) {2,}')
-_MULTI_BLANK = re.compile('\\n{3,}')
-_FENCE = re.compile('^```(?:markdown|md)?\\s*|\\s*```$', re.IGNORECASE)
+
+_HTML_COMMENT = re.compile(r'<!--.*?-->', re.DOTALL)
+_TOC_LEADERS = re.compile(r'[.\u2026]{4,}')
+_UNICODE_SPACE = re.compile(r'[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]')
+_ZERO_WIDTH = re.compile(r'[\u200b\u200c\u200d\ufeff\u00ad]')
+_TRAILING_WS = re.compile(r'[ \t]+$', re.MULTILINE)
+_INTERNAL_MULTI_SPACE = re.compile(r'(?<=\S) {2,}')
+_MULTI_BLANK = re.compile(r'\n{3,}')
+_FENCE = re.compile(r'^```(?:markdown|md)?\s*|\s*```$', re.IGNORECASE)
+
 PAGES_PER_CHUNK = 4
-MAX_BATCH_REQUESTS = 15
-MAX_CONCURRENT_PARSES = 5
 MAX_OUTPUT_TOKENS = 65536
+
 PARSE_PROMPT = '''Convert this PDF page batch into clean GitHub-flavored markdown, optimized for downstream chunking and embedding. This batch is a 4-page fragment of a larger document being processed in parallel — treat it as mid-stream, not standalone.
 
 OUTPUT FORMAT
@@ -78,15 +82,19 @@ EDGE CASES
 
 Treat the result as one continuous fragment of a single well-structured markdown document — no page-artifact residue, no chunk-boundary artifacts, nothing that would break when this output is concatenated with the batches before and after it.
 '''
+
 _loader: 'DocumentLoader | None' = None
 
+
 class DocumentLoader:
+    """Split PDFs into page groups and parse each group to markdown via Gemini."""
 
     def __init__(self) -> None:
         self.client = get_client()
 
     @staticmethod
     def clean_markdown(md_text: str) -> str:
+        """Normalize whitespace and strip common PDF-to-markdown artifacts."""
         text = md_text.replace('\r\n', '\n').replace('\r', '\n')
         text = unicodedata.normalize('NFC', text)
         text = html.unescape(text)
@@ -101,6 +109,7 @@ class DocumentLoader:
         return text.strip()
 
     def split_pdf(self, file_path: Path) -> tuple[int, list[bytes]]:
+        """Split a PDF into fixed-size page groups and return page count plus byte chunks."""
         payload = DocumentLoadInput(file_path=file_path)
         reader = PdfReader(str(payload.file_path))
         if not reader.pages:
@@ -113,24 +122,26 @@ class DocumentLoader:
             buffer = io.BytesIO()
             writer.write(buffer)
             chunks.append(buffer.getvalue())
-        return (len(reader.pages), chunks)
+        return len(reader.pages), chunks
 
-    def generate_markdown_piece(self, pdf_bytes: bytes, chunk_index: int) -> str:
-        response = self.client.models.generate_content(model=PDF_PARSER_MODEL, contents=[types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'), PARSE_PROMPT], config=types.GenerateContentConfig(temperature=0, max_output_tokens=MAX_OUTPUT_TOKENS))
+    def parse_chunk(self, pdf_bytes: bytes) -> str:
+        """Send one PDF byte chunk to Gemini and return raw markdown text."""
+        response = self.client.models.generate_content(
+            model=PDF_PARSER_MODEL,
+            contents=[
+                types.Part.from_bytes(data=pdf_bytes, mime_type='application/pdf'),
+                PARSE_PROMPT,
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+            ),
+        )
         return (response.text or '').strip()
 
-    async def aload_as_markdown(self, file_path: str | Path) -> str:
-        from ingest_pipeline import collect_markdown_only
-        return await collect_markdown_only(self, Path(file_path))
-
-    def load_as_markdown(self, file_path: str | Path) -> str:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            return asyncio.run(self.aload_as_markdown(file_path))
-        raise RuntimeError('load_as_markdown() cannot run inside an active event loop; use: await document_loader.aload_as_markdown(path)')
 
 def get_document_loader() -> DocumentLoader:
+    """Return the shared DocumentLoader instance."""
     global _loader
     if _loader is None:
         _loader = DocumentLoader()

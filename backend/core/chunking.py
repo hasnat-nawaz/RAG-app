@@ -1,3 +1,5 @@
+"""Markdown header-aware text splitter for RAG chunk creation."""
+
 import bootstrap
 import hashlib
 from langchain_core.documents import Document
@@ -8,6 +10,7 @@ _HEADER_KEYS: list[str] = [label for _, label in HEADERS_TO_SPLIT_ON]
 _chunker: 'Chunker | None' = None
 
 class Chunker:
+    """Split markdown into embeddable chunks with header metadata."""
 
     def __init__(self, max_chunk_chars: int=1800, chunk_overlap_chars: int=200, min_chunk_chars: int=150, merge_small_sections: bool=True, prepend_header_path_to_embedding_text: bool=True) -> None:
         self.splitter = MarkdownHeaderTextSplitter(headers_to_split_on=HEADERS_TO_SPLIT_ON, strip_headers=True)
@@ -19,6 +22,7 @@ class Chunker:
         self._prose_splitter = RecursiveCharacterTextSplitter(chunk_size=max_chunk_chars, chunk_overlap=chunk_overlap_chars, separators=['\n\n', '\n', '. ', '? ', '! ', '; ', ', ', ' ', ''])
 
     def chunk_markdown(self, text: str, source: str) -> list[dict]:
+        """Split one markdown document into embeddable chunk dicts."""
         payload = ChunkMarkdownInput(text=text, source=source)
         raw_docs = [doc for doc in self.splitter.split_text(payload.text) if doc.page_content.strip()]
         sections = self._merge_small_leaf_sections(raw_docs) if self.merge_small_sections else raw_docs
@@ -194,6 +198,7 @@ class Chunker:
         return chunks
 
 def get_chunker() -> Chunker:
+    """Return the shared Chunker instance."""
     global _chunker
     if _chunker is None:
         _chunker = Chunker()

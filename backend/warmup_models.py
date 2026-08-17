@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Pre-download the local reranker model during setup."""
+
 from pathlib import Path
 import sys
 
@@ -12,10 +14,13 @@ for path in (BACKEND_DIR, CORE_DIR):
 import bootstrap
 from reranker import MODEL_NAME, Reranker
 
+
 def main() -> None:
+    """Load the cross-encoder once so subsequent runs use the cached weights."""
     print(f'==> Caching reranker model ({MODEL_NAME})')
     Reranker()
     print('==> Local models ready')
+
 
 if __name__ == '__main__':
     main()

@@ -1,3 +1,5 @@
+"""Pydantic request/response models and shared validation constants."""
+
 import bootstrap
 from pathlib import Path
 from typing import Annotated, Any

@@ -1,5 +1,6 @@
+"""LanceDB vector store with hybrid search, HyDE, and FTS support."""
+
 import bootstrap
-import asyncio
 import json
 import math
 from pathlib import Path
@@ -7,8 +8,8 @@ from threading import Lock
 import lancedb
 from lancedb.index import FTS
 from embedding import get_embedder
-from logutil import plog
-from models.schemas import AddRecordsInput, DEFAULT_TOP_K, HybridSearchInput, KeywordSearchInput, RetrievedDocument, VectorSearchInput
+from models.schemas import AddRecordsInput, DEFAULT_TOP_K, KeywordSearchInput, RetrievedDocument, VectorSearchInput
+from pipeline_log import log
 from query_optimization.hypothetical_document import generate_hypothetical_document
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / 'storage' / 'lanceDB'
 DEFAULT_TABLE_NAME = 'EmbeddingsTable'
@@ -18,6 +19,7 @@ def _is_nan(value) -> bool:
     return isinstance(value, float) and math.isnan(value)
 
 def encode_metadata(metadata: dict | None) -> str:
+    """Serialize chunk metadata to a JSON string for LanceDB storage."""
     clean: dict = {}
     for key, value in (metadata or {}).items():
         if value is None or _is_nan(value):
@@ -31,6 +33,7 @@ def encode_metadata(metadata: dict | None) -> str:
     return json.dumps(clean, ensure_ascii=False)
 
 def decode_metadata(value) -> dict:
+    """Parse stored metadata back into a plain dict."""
     if value is None or _is_nan(value):
         return {}
     if isinstance(value, dict):
@@ -47,6 +50,7 @@ def decode_metadata(value) -> dict:
     return {}
 
 class VectorStore:
+    """Read and write embedded document chunks in LanceDB."""
 
     def __init__(self, db_path: str | Path=DEFAULT_DB_PATH, table_name: str=DEFAULT_TABLE_NAME, *, embedder=None) -> None:
         self.db_path = Path(db_path)
@@ -58,7 +62,6 @@ class VectorStore:
         self._fts_index_ready: bool | None = None
         self._write_lock = Lock()
         if self.table is not None and self._metadata_column_is_struct():
-            plog('db', event='migrate_start', detail='metadata_struct_to_json')
             with self._write_lock:
                 self._migrate_metadata_to_json_unlocked()
 
@@ -68,6 +71,7 @@ class VectorStore:
         return None
 
     def ensure_queryable(self) -> None:
+        """Verify the database exists and has at least one row."""
         if self.table is None:
             self.table = self._open_table_if_exists()
         if self.table is None:
@@ -76,11 +80,10 @@ class VectorStore:
             row_count = self.table.count_rows()
         except Exception as exc:
             if self._looks_like_missing_or_corrupt(exc):
-                plog('db', event='unreadable_reset', error=str(exc)[:160])
                 try:
                     self.reset_table()
-                except Exception as reset_exc:
-                    plog('db', event='reset_failed', error=str(reset_exc)[:160])
+                except Exception:
+                    pass
                 raise RuntimeError('Database is empty.') from exc
             raise RuntimeError('Something went wrong while searching the database.') from exc
         if row_count == 0:
@@ -109,8 +112,7 @@ class VectorStore:
                 return 1
             max_id = int(self.table.to_pandas()['id'].max())
             return max_id + 1
-        except Exception as exc:
-            plog('db', event='id_alloc_reset', error=str(exc)[:160])
+        except Exception:
             self._drop_table_unlocked()
             return 1
 
@@ -147,8 +149,7 @@ class VectorStore:
                 if 'source' not in df.columns:
                     return 0
                 return int((df['source'] == source).sum())
-            except Exception as exc:
-                plog('db', event='count_by_source_fail', source=source, error=str(exc)[:160])
+            except Exception:
                 return 0
 
     def has_source(self, source: str) -> bool:
@@ -171,13 +172,10 @@ class VectorStore:
             elif deleted:
                 try:
                     self._update_fts_index()
-                except Exception as exc:
-                    plog('db', event='fts_refresh_fail', error=str(exc)[:160])
-            if deleted:
-                plog('db', event='deleted_by_source', source=source, rows=deleted)
+                except Exception:
+                    pass
             return deleted
-        except Exception as exc:
-            plog('db', event='delete_by_source_fail', source=source, error=str(exc)[:160])
+        except Exception:
             return 0
 
     def _metadata_column_is_struct(self) -> bool:
@@ -189,9 +187,9 @@ class VectorStore:
                 if getattr(field, 'name', None) == 'metadata':
                     type_name = str(getattr(field, 'type', '')).lower()
                     return type_name.startswith('struct')
-        except Exception as exc:
-            plog('db', event='schema_inspect_fail', error=str(exc)[:160])
-        return False
+            return False
+        except Exception:
+            return False
 
     def _migrate_metadata_to_json_unlocked(self) -> None:
         if self.table is None:
@@ -212,9 +210,6 @@ class VectorStore:
             self.table = self.db.create_table(self.table_name, data=migrated)
             self._fts_index_ready = None
             self._update_fts_index()
-            plog('db', event='migrate_done', rows=len(migrated))
-        else:
-            plog('db', event='migrate_done', rows=0)
 
     def add(self, chunks: list[dict], embeddings: list[list[float]]) -> int:
         sanitized = [self._strip_embedding_text(chunk) if isinstance(chunk, dict) else chunk for chunk in chunks]
@@ -222,7 +217,6 @@ class VectorStore:
         sources = sorted({chunk.source for chunk in payload.chunks})
         with self._write_lock:
             if self.table is not None and self._metadata_column_is_struct():
-                plog('db', event='migrate_before_add')
                 self._migrate_metadata_to_json_unlocked()
             start_id = self._next_id()
             rows = [{'id': row_id, 'source': chunk.source, 'content': chunk.content, 'metadata': encode_metadata(chunk.metadata), 'vector': list(embedding)} for row_id, (chunk, embedding) in enumerate(zip(payload.chunks, payload.embeddings), start=start_id)]
@@ -234,7 +228,6 @@ class VectorStore:
             except Exception as exc:
                 text = str(exc).lower()
                 if 'does not exist in table schema' in text or 'field' in text:
-                    plog('db', event='schema_mismatch_retry', error=str(exc)[:160])
                     try:
                         self._migrate_metadata_to_json_unlocked()
                         if self.table is None:
@@ -242,12 +235,10 @@ class VectorStore:
                         else:
                             self.table.add(rows)
                     except Exception as retry_exc:
-                        plog('db', event='write_fail_after_migrate', sources=','.join(sources), error=str(retry_exc)[:160])
                         for source in sources:
                             self._delete_by_source_unlocked(source)
                         raise RuntimeError(f'Failed to write embeddings to the database: {retry_exc}') from retry_exc
                 else:
-                    plog('db', event='write_fail', sources=','.join(sources), error=str(exc)[:160])
                     for source in sources:
                         self._delete_by_source_unlocked(source)
                     raise RuntimeError(f'Failed to write embeddings to the database: {exc}') from exc
@@ -300,7 +291,8 @@ class VectorStore:
                 merged.append(doc)
         return merged
 
-    def sequential_search(self, query_vector: list[float], top_k: int=DEFAULT_TOP_K) -> list[dict]:
+    def semantic_search(self, query_vector: list[float], top_k: int = DEFAULT_TOP_K) -> list[dict]:
+        """Find the top-k chunks closest to a query embedding (cosine similarity)."""
         if self.table is None:
             raise RuntimeError('Database is empty.')
         payload = VectorSearchInput(query_vector=query_vector, top_k=top_k)
@@ -308,7 +300,6 @@ class VectorStore:
             rows = self.table.search(payload.query_vector).metric('cosine').limit(payload.top_k).to_list()
         except Exception as exc:
             if self._looks_like_missing_or_corrupt(exc):
-                plog('db', event='dense_search_empty', error=str(exc)[:160])
                 try:
                     self.reset_table()
                 except Exception:
@@ -327,7 +318,6 @@ class VectorStore:
             rows = self.table.search(payload.query, query_type='fts', fts_columns='content').limit(payload.top_k).to_list()
         except Exception as exc:
             if self._looks_like_missing_or_corrupt(exc):
-                plog('db', event='bm25_search_empty', error=str(exc)[:160])
                 try:
                     self.reset_table()
                 except Exception:
@@ -337,22 +327,18 @@ class VectorStore:
         return self._rows_to_documents(rows)
 
     def hyde(self, query: str, top_k: int=DEFAULT_TOP_K) -> list[dict]:
+        """Retrieve chunks by embedding a HyDE hypothetical answer passage."""
         payload = KeywordSearchInput(query=query, top_k=top_k)
+        log("HYDE", "generating hypothetical document")
         hypothetical_doc = generate_hypothetical_document(payload.query)
+        log("HYDE", "embedding hypothetical document")
         query_vector = self.embedder.embed_query(hypothetical_doc)
-        return self.sequential_search(query_vector, top_k=payload.top_k)
-
-    async def ahybrid_search(self, query: str, top_k: int=DEFAULT_TOP_K) -> list[dict]:
-        payload = HybridSearchInput(query=query, top_k=top_k)
-        query_vector = await asyncio.to_thread(self.embedder.embed_query, payload.query)
-        dense_docs, sparse_docs = await asyncio.gather(asyncio.to_thread(self.sequential_search, query_vector, payload.top_k), asyncio.to_thread(self.bm25, payload.query, payload.top_k))
-        return self.merge_documents(dense_docs, sparse_docs)
-
-    async def ahyde(self, query: str, top_k: int=DEFAULT_TOP_K) -> list[dict]:
-        payload = KeywordSearchInput(query=query, top_k=top_k)
-        return await asyncio.to_thread(self.hyde, payload.query, payload.top_k)
+        docs = self.semantic_search(query_vector, top_k=payload.top_k)
+        log("HYDE", f"found {len(docs)} chunks")
+        return docs
 
 def get_vector_store(db_path: str | Path=DEFAULT_DB_PATH, table_name: str=DEFAULT_TABLE_NAME, *, embedder=None) -> VectorStore:
+    """Return the shared VectorStore instance for the given path."""
     global _store
     resolved = Path(db_path)
     if _store is None or _store.db_path != resolved or _store.table_name != table_name:

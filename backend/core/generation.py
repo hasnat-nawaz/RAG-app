@@ -1,3 +1,5 @@
+"""Gemini answer generation with grounded citations and source normalization."""
+
 import bootstrap
 import json
 import re
@@ -5,6 +7,7 @@ from google.genai import types
 from gemini_retry import run_with_retries
 from llm_client import GENERATION_MODEL, get_client
 from models.schemas import GenerationInput, GenerationOutput
+
 INSUFFICIENT_CONTEXT_MESSAGE = 'The provided documents do not contain enough information to answer this question.'
 _SOURCES_HEADING_RE = re.compile(r'(?is)((?:^|\n)(?:#{1,6}\s*)?Sources[ \t]*\n+)(.*)\Z')
 _CITATION_SPLIT_RE = re.compile(r'(?<=\S)\s+(?=\[\d+\]\s)')
@@ -66,6 +69,7 @@ OUTPUT FORMAT
 _generator: 'Generator | None' = None
 
 def _normalize_sources_section(answer: str) -> str:
+    """Fix malformed Sources lists when the model merges citations onto one line."""
     match = _SOURCES_HEADING_RE.search(answer)
     if not match:
         return answer
@@ -92,11 +96,13 @@ def _normalize_sources_section(answer: str) -> str:
     return answer[:match.start(1)] + heading.rstrip() + '\n' + '\n'.join(entries)
 
 class Generator:
+    """Call Gemini with retrieved chunks and return a cited Markdown answer."""
 
     def __init__(self) -> None:
         self.client = get_client()
 
     def _format_documents(self, payload: GenerationInput) -> str:
+        """Build the source-documents block sent to the generation model."""
         blocks: list[str] = []
         for doc in payload.documents:
             metadata_str = json.dumps(doc.metadata, ensure_ascii=False) if doc.metadata else '{}'
@@ -106,6 +112,7 @@ class Generator:
         return '\n\n'.join(blocks)
 
     def generate_response(self, query: str, documents: list[dict]) -> str:
+        """Generate a grounded answer for the query using reranked chunks."""
         payload = GenerationInput(query=query, documents=documents)
         user_message = f'Question:\n{payload.query}\n\nSource documents:\n{self._format_documents(payload)}\n\nAnswer the question using only the source documents above, citing each factual sentence as instructed.'
 
@@ -116,10 +123,11 @@ class Generator:
                 raise RuntimeError('LLM returned an empty response.')
             return answer
 
-        answer = run_with_retries('generate', _call, pipeline='generate')
+        answer = run_with_retries('generate', _call)
         return GenerationOutput(answer=_normalize_sources_section(answer)).answer
 
 def get_generator() -> Generator:
+    """Return the shared Generator instance."""
     global _generator
     if _generator is None:
         _generator = Generator()

@@ -1,7 +1,10 @@
+"""Environment bootstrap: sys.path setup and .env loading."""
+
 import os
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
+
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 sys.dont_write_bytecode = True
 _BACKEND = Path(__file__).resolve().parent

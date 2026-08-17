@@ -1,494 +1,251 @@
+"""Parallel PDF ingest pipeline: LLM parse, chunk, and embed in three async workers."""
+
 from __future__ import annotations
 
 import asyncio
-import time
-from collections import deque
 from pathlib import Path
 
-from document_loader import (
-    MAX_BATCH_REQUESTS,
-    MAX_CONCURRENT_PARSES,
-    PAGES_PER_CHUNK,
-    DocumentLoader,
-)
-from embedding import Embedder
-from gemini_retry import MAX_RETRIES, arun_with_retries
-from logutil import Timer, plog
+from chunking import get_chunker
+from document_loader import DocumentLoader, get_document_loader
+from embedding import get_embedder
+from gemini_retry import is_quota_error, should_retry
 from models.schemas import MAX_EMBED_BATCH_SIZE
+from pipeline_log import log
+from vector_store import get_vector_store
 
-EMBED_BATCH_SIZE = MAX_EMBED_BATCH_SIZE
-EMBED_PACK_PAUSE_SECONDS = 1.25
+BATCH_SIZE = 15
+MAX_RETRIES = 5
+COOLDOWN_SECONDS = 65.0
+
+STORAGE_DIR = Path(__file__).resolve().parents[1] / "storage"
+PDF_DIR = STORAGE_DIR / "pdfs"
+MARKDOWN_DIR = STORAGE_DIR / "markdown"
+
+_SENTINEL = None
 
 
 class IngestFailed(RuntimeError):
-    pass
+    """Raised when ingest cannot complete after retries or worker failure."""
 
 
-async def ingest_pdf(
-    *,
-    pdf_path: Path,
-    loader: DocumentLoader,
-    chunker,
-    embedder: Embedder,
-    vector_store,
-    markdown_dir: Path,
-) -> dict:
-    pipeline = _DualIngestPipeline(
-        pdf_path=pdf_path,
-        loader=loader,
-        chunker=chunker,
-        embedder=embedder,
-        vector_store=vector_store,
-        markdown_dir=markdown_dir,
-    )
-    return await pipeline.run()
-
-
-async def collect_markdown_only(loader: DocumentLoader, pdf_path: Path) -> str:
-    page_count, pieces = await asyncio.to_thread(loader.split_pdf, pdf_path)
-    total_waves = max(1, (len(pieces) + MAX_BATCH_REQUESTS - 1) // MAX_BATCH_REQUESTS)
-    plog(
-        "markdown",
-        event="split",
-        file=pdf_path.name,
-        pages=page_count,
-        pieces=len(pieces),
-        waves=total_waves,
-    )
-    parts: list[str] = []
-    for wave_number, start in enumerate(
-        range(0, len(pieces), MAX_BATCH_REQUESTS), start=1
-    ):
-        wave = pieces[start : start + MAX_BATCH_REQUESTS]
-        md = await _parse_wave(
-            loader=loader,
-            wave=wave,
-            wave_offset=start,
-            wave_number=wave_number,
-            total_waves=total_waves,
-            timer=Timer(),
-        )
-        if md:
-            parts.append(md)
-    cleaned = loader.clean_markdown("\n\n".join(parts))
-    if not cleaned:
-        raise IngestFailed(
-            f"Document loader produced empty markdown for {pdf_path.name}."
-        )
-    return cleaned
-
-
-class _DualIngestPipeline:
-    def __init__(
-        self,
-        *,
-        pdf_path: Path,
-        loader: DocumentLoader,
-        chunker,
-        embedder: Embedder,
-        vector_store,
-        markdown_dir: Path,
-    ) -> None:
-        self.pdf_path = pdf_path
-        self.loader = loader
-        self.chunker = chunker
-        self.embedder = embedder
-        self.vector_store = vector_store
-        self.markdown_dir = markdown_dir
-        self._pending: deque[dict] = deque()
-        self._cond = asyncio.Condition()
-        self._producer_done = False
-        self._flush_pending = False
-        self._markdown_parts: list[str] = []
-        self._all_chunks: list[dict] = []
-        self._all_embeddings: list[list[float]] = []
-        self._timer = Timer()
-
-    async def run(self) -> dict:
-        plog(
-            "ingest",
-            event="start",
-            file=self.pdf_path.name,
-            pages_per_piece=PAGES_PER_CHUNK,
-            wave_size=MAX_BATCH_REQUESTS,
-            concurrency=MAX_CONCURRENT_PARSES,
-            embed_pack=EMBED_BATCH_SIZE,
-            retries=MAX_RETRIES,
-        )
-
-        producer = asyncio.create_task(
-            self._markdown_producer(),
-            name=f"markdown-producer:{self.pdf_path.name}",
-        )
-        worker = asyncio.create_task(
-            self._embed_worker(),
-            name=f"embed-worker:{self.pdf_path.name}",
-        )
-
-        try:
-            await asyncio.gather(producer, worker)
-        except Exception as exc:
-            producer.cancel()
-            worker.cancel()
-            await asyncio.gather(producer, worker, return_exceptions=True)
-            if isinstance(exc, IngestFailed):
-                raise
-            raise IngestFailed(str(exc)) from exc
-
-        t_systems = self._timer.elapsed()
-
-        full_markdown = self.loader.clean_markdown("\n\n".join(self._markdown_parts))
-        if not full_markdown:
-            raise IngestFailed(
-                f"Document loader produced empty markdown for {self.pdf_path.name}."
-            )
-        if not self._all_chunks:
-            raise IngestFailed(f"No chunks produced for {self.pdf_path.name}")
-        if len(self._all_embeddings) != len(self._all_chunks):
-            raise IngestFailed(
-                f"Embed mismatch: {len(self._all_embeddings)} vectors for "
-                f"{len(self._all_chunks)} chunks."
-            )
-
-        plog(
-            "db",
-            event="write_start",
-            file=self.pdf_path.name,
-            chunks=len(self._all_chunks),
-            elapsed_s=self._timer.elapsed(),
-        )
-        t_db0 = time.perf_counter()
-        try:
-            rows_added = await asyncio.to_thread(
-                self.vector_store.add, self._all_chunks, self._all_embeddings
-            )
-        except Exception as exc:
-            try:
-                await asyncio.to_thread(
-                    self.vector_store.delete_by_source, self.pdf_path.name
-                )
-            except Exception as cleanup_exc:
-                plog("db", event="rollback_fail", error=str(cleanup_exc)[:160])
-            raise IngestFailed(f"Database write failed: {exc}") from exc
-        db_seconds = time.perf_counter() - t_db0
-        plog(
-            "db",
-            event="write_done",
-            file=self.pdf_path.name,
-            rows=rows_added,
-            elapsed_s=db_seconds,
-        )
-
-        self.markdown_dir.mkdir(parents=True, exist_ok=True)
-        md_path = self.markdown_dir / f"{self.pdf_path.stem}.md"
-        try:
-            await asyncio.to_thread(
-                md_path.write_text, full_markdown, encoding="utf-8"
-            )
-        except Exception as exc:
-            try:
-                await asyncio.to_thread(
-                    self.vector_store.delete_by_source, self.pdf_path.name
-                )
-            except Exception as cleanup_exc:
-                plog("db", event="rollback_fail", error=str(cleanup_exc)[:160])
-            md_path.unlink(missing_ok=True)
-            raise IngestFailed(f"Failed to save markdown file: {exc}") from exc
-
-        total_seconds = self._timer.elapsed()
-        timings = {
-            "systems_seconds": round(t_systems, 3),
-            "db_seconds": round(db_seconds, 3),
-            "total_seconds": round(total_seconds, 3),
-            "markdown_waves": len(self._markdown_parts),
-            "chunks": len(self._all_chunks),
-        }
-        plog(
-            "ingest",
-            event="done",
-            file=self.pdf_path.name,
-            waves=len(self._markdown_parts),
-            chunks=len(self._all_chunks),
-            rows=rows_added,
-            md_chars=len(full_markdown),
-            systems_s=t_systems,
-            db_s=db_seconds,
-            total_s=total_seconds,
-        )
-        return {
-            "markdown_path": md_path.name,
-            "chunks": len(self._all_chunks),
-            "rows_added": rows_added,
-            "timings": timings,
-        }
-
-    async def _markdown_producer(self) -> None:
-        try:
-            page_count, pieces = await asyncio.to_thread(
-                self.loader.split_pdf, self.pdf_path
-            )
-            total_waves = max(
-                1, (len(pieces) + MAX_BATCH_REQUESTS - 1) // MAX_BATCH_REQUESTS
-            )
-            plog(
-                "markdown",
-                event="split",
-                file=self.pdf_path.name,
-                pages=page_count,
-                pieces=len(pieces),
-                waves=total_waves,
-                elapsed_s=self._timer.elapsed(),
-            )
-
-            for wave_number, start in enumerate(
-                range(0, len(pieces), MAX_BATCH_REQUESTS), start=1
-            ):
-                wave = pieces[start : start + MAX_BATCH_REQUESTS]
-                plog(
-                    "markdown",
-                    event="wave_start",
-                    wave=f"{wave_number}/{total_waves}",
-                    pieces=len(wave),
-                    elapsed_s=self._timer.elapsed(),
-                )
-                markdown = await _parse_wave(
-                    loader=self.loader,
-                    wave=wave,
-                    wave_offset=start,
-                    wave_number=wave_number,
-                    total_waves=total_waves,
-                    timer=self._timer,
-                )
-                if markdown:
-                    self._markdown_parts.append(markdown)
-                    await self._enqueue_markdown(markdown, wave_number, total_waves)
-                else:
-                    plog(
-                        "markdown",
-                        event="wave_empty",
-                        wave=f"{wave_number}/{total_waves}",
-                        elapsed_s=self._timer.elapsed(),
-                    )
-
-            plog(
-                "markdown",
-                event="done",
-                waves_nonempty=len(self._markdown_parts),
-                elapsed_s=self._timer.elapsed(),
-            )
-        finally:
-            async with self._cond:
-                self._producer_done = True
-                self._cond.notify_all()
-            plog("markdown", event="producer_signal_done", elapsed_s=self._timer.elapsed())
-
-    async def _enqueue_markdown(
-        self,
-        markdown: str,
-        wave_number: int,
-        total_waves: int,
-    ) -> None:
-        t0 = time.perf_counter()
-        chunks = await asyncio.to_thread(
-            self.chunker.chunk_markdown, markdown, self.pdf_path.name
-        )
-        chunk_s = time.perf_counter() - t0
-        if not chunks:
-            plog(
-                "chunker",
-                event="empty",
-                wave=f"{wave_number}/{total_waves}",
-                md_chars=len(markdown),
-                elapsed_s=chunk_s,
-            )
-            return
-
-        for i, chunk in enumerate(chunks):
-            if not (chunk.get("embedding_text") or chunk.get("content")):
-                raise IngestFailed(
-                    f"[chunker] wave {wave_number}: chunk {i} missing text fields"
-                )
-
-        async with self._cond:
-            self._pending.extend(chunks)
-            self._flush_pending = True
-            pending_count = len(self._pending)
-            self._cond.notify_all()
-
-        avg_chars = int(sum(len(c.get("content") or "") for c in chunks) / len(chunks))
-        plog(
-            "chunker",
-            event="queued",
-            wave=f"{wave_number}/{total_waves}",
-            chunks=len(chunks),
-            avg_chars=avg_chars,
-            fifo_pending=pending_count,
-            embed_flush=True,
-            elapsed_s=chunk_s,
-        )
-
-    async def _embed_worker(self) -> None:
-        embed_batch_index = 0
-        plog("embed", event="worker_start", elapsed_s=self._timer.elapsed())
-        try:
-            while True:
-                async with self._cond:
-                    while True:
-                        can_full = len(self._pending) >= EMBED_BATCH_SIZE
-                        can_flush = self._flush_pending and bool(self._pending)
-                        can_drain = self._producer_done and bool(self._pending)
-                        if can_full or can_flush or can_drain:
-                            break
-                        if self._producer_done and not self._pending:
-                            plog(
-                                "embed",
-                                event="worker_done",
-                                total_embedded=len(self._all_chunks),
-                                elapsed_s=self._timer.elapsed(),
-                            )
-                            return
-                        await self._cond.wait()
-
-                    take = min(EMBED_BATCH_SIZE, len(self._pending))
-                    batch = [self._pending.popleft() for _ in range(take)]
-                    still_pending = len(self._pending)
-                    if still_pending == 0:
-                        self._flush_pending = False
-                    reason = (
-                        "full"
-                        if take >= EMBED_BATCH_SIZE
-                        else ("flush" if not self._producer_done else "drain")
-                    )
-
-                embed_batch_index += 1
-                texts = [
-                    (c.get("embedding_text") or c.get("content") or "").strip()
-                    for c in batch
-                ]
-                if any(not t for t in texts):
-                    raise IngestFailed(
-                        f"[embed] pack {embed_batch_index}: empty embedding_text"
-                    )
-
-                plog(
-                    "embed",
-                    event="pack_start",
-                    pack=embed_batch_index,
-                    size=len(batch),
-                    reason=reason,
-                    fifo_left=still_pending,
-                    elapsed_s=self._timer.elapsed(),
-                )
-                t0 = time.perf_counter()
-                vectors = await arun_with_retries(
-                    f"embed_pack_{embed_batch_index}",
-                    lambda t=texts: self.embedder.embed_texts(
-                        t, label=f"embed_pack_{embed_batch_index}"
-                    ),
-                    max_retries=MAX_RETRIES,
-                    pipeline="embed",
-                )
-                embed_s = time.perf_counter() - t0
-                if len(vectors) != len(batch):
-                    raise IngestFailed(
-                        f"[embed] pack {embed_batch_index}: got {len(vectors)} "
-                        f"vectors for {len(batch)} chunks"
-                    )
-
-                self._all_chunks.extend(batch)
-                self._all_embeddings.extend(vectors)
-                plog(
-                    "embed",
-                    event="pack_done",
-                    pack=embed_batch_index,
-                    size=len(batch),
-                    total_embedded=len(self._all_chunks),
-                    elapsed_s=embed_s,
-                )
-                async with self._cond:
-                    more_work = bool(self._pending) or not self._producer_done
-                if more_work:
-                    await asyncio.sleep(EMBED_PACK_PAUSE_SECONDS)
-        except asyncio.CancelledError:
-            plog("embed", event="worker_cancelled", elapsed_s=self._timer.elapsed())
-            raise
-        except Exception as exc:
-            plog("embed", event="worker_failed", error=str(exc)[:200])
-            raise
-
-
-async def _parse_wave(
-    *,
-    loader: DocumentLoader,
-    wave: list[bytes],
-    wave_offset: int,
-    wave_number: int,
-    total_waves: int,
-    timer: Timer,
-) -> str:
-    parts: list[str] = []
-    total_groups = (len(wave) + MAX_CONCURRENT_PARSES - 1) // MAX_CONCURRENT_PARSES
-    t_wave = time.perf_counter()
-
-    for group_start in range(0, len(wave), MAX_CONCURRENT_PARSES):
-        group = wave[group_start : group_start + MAX_CONCURRENT_PARSES]
-        group_number = group_start // MAX_CONCURRENT_PARSES + 1
-        plog(
-            "markdown",
-            event="group_start",
-            wave=f"{wave_number}/{total_waves}",
-            group=f"{group_number}/{total_groups}",
-            concurrent=len(group),
-            elapsed_s=timer.elapsed(),
-        )
-        t0 = time.perf_counter()
-        group_parts = await asyncio.gather(
-            *[
-                _parse_piece(
-                    loader=loader,
-                    pdf_bytes=piece,
-                    chunk_index=wave_offset + group_start + offset,
-                    wave_number=wave_number,
-                    total_waves=total_waves,
-                )
-                for offset, piece in enumerate(group)
-            ]
-        )
-        non_empty = sum(1 for p in group_parts if p)
-        plog(
-            "markdown",
-            event="group_done",
-            wave=f"{wave_number}/{total_waves}",
-            group=f"{group_number}/{total_groups}",
-            nonempty=f"{non_empty}/{len(group)}",
-            elapsed_s=time.perf_counter() - t0,
-        )
-        parts.extend(group_parts)
-
-    joined = "\n\n".join(part for part in parts if part)
-    cleaned = loader.clean_markdown(joined)
-    plog(
-        "markdown",
-        event="wave_done",
-        wave=f"{wave_number}/{total_waves}",
-        chars=len(cleaned),
-        elapsed_s=time.perf_counter() - t_wave,
-    )
-    return cleaned
-
-
-async def _parse_piece(
-    *,
+async def _parse_single_chunk(
     loader: DocumentLoader,
     pdf_bytes: bytes,
-    chunk_index: int,
-    wave_number: int,
-    total_waves: int,
+    chunk_idx: int,
+    total_chunks: int,
+    batch_num: int,
 ) -> str:
-    label = f"md_w{wave_number}_p{chunk_index + 1}"
-    return await arun_with_retries(
-        label,
-        lambda: loader.generate_markdown_piece(pdf_bytes, chunk_index),
-        max_retries=MAX_RETRIES,
-        pipeline="markdown",
-    )
+    """Parse one 4-page PDF slice to markdown with per-chunk retries."""
+    label = f"chunk {chunk_idx + 1}/{total_chunks}"
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            md = await asyncio.to_thread(loader.parse_chunk, pdf_bytes)
+            return loader.clean_markdown(md)
+        except Exception as exc:
+            if not should_retry(exc) or attempt >= MAX_RETRIES:
+                raise
+            log("LLM", f"batch {batch_num} {label} — retry {attempt}/{MAX_RETRIES}")
+            await asyncio.sleep(COOLDOWN_SECONDS if is_quota_error(exc) else 8.0)
+    return ""
+
+
+async def _llm_system(
+    loader: DocumentLoader,
+    pdf_chunks: list[bytes],
+    md_queue: asyncio.Queue[list[str] | None],
+    source: str,
+) -> None:
+    """Send PDF slices to Gemini in batches of 15; enqueue full markdown batches."""
+    total = len(pdf_chunks)
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for batch_num in range(1, total_batches + 1):
+        start = (batch_num - 1) * BATCH_SIZE
+        end = min(start + BATCH_SIZE, total)
+        batch = pdf_chunks[start:end]
+
+        log("LLM", f"batch {batch_num}/{total_batches} — sending {len(batch)} chunks")
+
+        tasks = [
+            _parse_single_chunk(loader, b, start + i, total, batch_num)
+            for i, b in enumerate(batch)
+        ]
+        results = await asyncio.gather(*tasks)
+        batch_markdown = [md for md in results if md]
+
+        log(
+            "LLM",
+            f"batch {batch_num}/{total_batches} — received {len(batch_markdown)}/{len(batch)} responses",
+        )
+
+        if batch_markdown:
+            await md_queue.put(batch_markdown)
+
+        if batch_num < total_batches:
+            log("LLM", f"cooldown {COOLDOWN_SECONDS:.0f}s before next batch")
+            await asyncio.sleep(COOLDOWN_SECONDS)
+
+    await md_queue.put(_SENTINEL)
+
+
+async def _chunker_system(
+    md_queue: asyncio.Queue[list[str] | None],
+    chunk_queue: asyncio.Queue[list[dict] | None],
+    source: str,
+) -> None:
+    """Chunk each completed LLM batch in order and forward all chunks at once."""
+    chunker = get_chunker()
+    batches_processed = 0
+
+    while True:
+        markdown_batch = await md_queue.get()
+        if markdown_batch is _SENTINEL:
+            await chunk_queue.put(_SENTINEL)
+            break
+
+        batches_processed += 1
+        batch_chunks: list[dict] = []
+        for md in markdown_batch:
+            piece_chunks = await asyncio.to_thread(chunker.chunk_markdown, md, source)
+            batch_chunks.extend(piece_chunks)
+
+        if batch_chunks:
+            log(
+                "CHUNKER",
+                f"batch {batches_processed} — produced {len(batch_chunks)} chunks "
+                f"from {len(markdown_batch)} markdown pieces",
+            )
+            await chunk_queue.put(batch_chunks)
+
+    log("CHUNKER", f"finished — processed {batches_processed} batches")
+
+
+async def _embed_batch_with_retry(
+    embedder,
+    texts: list[str],
+    batch_label: str,
+) -> list[list[float]]:
+    """Embed a text batch with retries on transient API errors."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return await asyncio.to_thread(
+                embedder.embed_texts, texts, label=batch_label,
+            )
+        except Exception as exc:
+            if not should_retry(exc) or attempt >= MAX_RETRIES:
+                raise
+            log("EMBEDDER", f"{batch_label} — retry {attempt}/{MAX_RETRIES}")
+            await asyncio.sleep(COOLDOWN_SECONDS if is_quota_error(exc) else 8.0)
+    return []
+
+
+async def _embedder_system(
+    chunk_queue: asyncio.Queue[list[dict] | None],
+    source: str,
+) -> None:
+    """Embed chunk batches (up to 90 per API call) and store vectors in LanceDB."""
+    embedder = get_embedder()
+    store = get_vector_store()
+    embed_round = 0
+    total_stored = 0
+    batches_processed = 0
+
+    while True:
+        batch_chunks = await chunk_queue.get()
+        if batch_chunks is _SENTINEL:
+            break
+
+        batches_processed += 1
+        pending = list(batch_chunks)
+
+        while pending:
+            slice_size = min(len(pending), MAX_EMBED_BATCH_SIZE)
+            to_embed = pending[:slice_size]
+            pending = pending[slice_size:]
+            embed_round += 1
+            total_stored += await _embed_and_store(
+                embedder,
+                store,
+                to_embed,
+                embed_round,
+                source,
+            )
+            if pending:
+                log("EMBEDDER", f"cooldown {COOLDOWN_SECONDS:.0f}s")
+                await asyncio.sleep(COOLDOWN_SECONDS)
+
+        log(
+            "EMBEDDER",
+            f"batch {batches_processed} — stored {len(batch_chunks)} chunks",
+        )
+
+    log("EMBEDDER", f"finished — stored {total_stored} chunks total")
+
+
+async def _embed_and_store(
+    embedder,
+    store,
+    chunks: list[dict],
+    round_num: int,
+    source: str,
+) -> int:
+    """Embed one slice of chunks and write them to the vector store."""
+    texts = [c.get("embedding_text") or c.get("content", "") for c in chunks]
+    label = f"round {round_num} ({len(chunks)} chunks)"
+    log("EMBEDDER", f"{label} — embedding")
+
+    vectors = await _embed_batch_with_retry(embedder, texts, label)
+    await asyncio.to_thread(store.add, chunks, vectors)
+    return len(chunks)
+
+
+def _cleanup_file(source: str) -> None:
+    """Remove stored PDF, markdown, and vector rows for a failed upload."""
+    pdf_path = PDF_DIR / source
+    md_path = MARKDOWN_DIR / (Path(source).stem + ".md")
+    for p in (pdf_path, md_path):
+        if p.is_file():
+            p.unlink(missing_ok=True)
+
+    store = get_vector_store()
+    store.delete_by_source(source)
+
+
+async def ingest_pdf(pdf_path: Path, source: str) -> dict:
+    """Ingest a PDF by running LLM, chunker, and embedder workers in parallel."""
+    loader = get_document_loader()
+
+    log("LLM", f"splitting {source} into 4-page chunks")
+    total_pages, pdf_chunks = await asyncio.to_thread(loader.split_pdf, pdf_path)
+    total_chunks = len(pdf_chunks)
+
+    log("LLM", f"{source} — {total_pages} pages, {total_chunks} chunks, "
+        f"{(total_chunks + BATCH_SIZE - 1) // BATCH_SIZE} batches")
+
+    md_queue: asyncio.Queue[list[str] | None] = asyncio.Queue()
+    chunk_queue: asyncio.Queue[list[dict] | None] = asyncio.Queue()
+
+    llm_task = asyncio.create_task(_llm_system(loader, pdf_chunks, md_queue, source))
+    chunker_task = asyncio.create_task(_chunker_system(md_queue, chunk_queue, source))
+    embedder_task = asyncio.create_task(_embedder_system(chunk_queue, source))
+
+    try:
+        await asyncio.gather(llm_task, chunker_task, embedder_task)
+    except Exception as exc:
+        for t in (llm_task, chunker_task, embedder_task):
+            t.cancel()
+        await asyncio.gather(llm_task, chunker_task, embedder_task, return_exceptions=True)
+        _cleanup_file(source)
+        raise IngestFailed(f"Upload failed for {source}") from exc
+
+    md_path = MARKDOWN_DIR / (Path(source).stem + ".md")
+    stored = get_vector_store().count_by_source(source)
+
+    log("LLM", f"{source} — complete ({stored} chunks stored)")
+
+    return {
+        "source": source,
+        "pages": total_pages,
+        "chunks_stored": stored,
+        "markdown_path": str(md_path) if md_path.is_file() else None,
+    }

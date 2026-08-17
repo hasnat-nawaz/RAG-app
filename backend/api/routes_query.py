@@ -1,3 +1,5 @@
+"""FastAPI query route: retrieve, rerank, and generate grounded answers."""
+
 import bootstrap  # noqa: F401
 
 import asyncio
@@ -5,22 +7,40 @@ import time
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from google.genai import errors as genai_errors
 from pydantic import ValidationError
 
-from logutil import Timer, plog
+from gemini_retry import is_quota_error
 from models.schemas import QueryRequest, QueryResponse
+from pipeline_log import log
+from query_optimization.query_expansion import expand_query
+from query_optimization.query_rewriting import rewrite_query
 
 router = APIRouter()
 
 EMPTY_DB_ANSWER = "Database is empty."
+QUOTA_MESSAGE = "API limit reached. Please try again in a minute."
+UNEXPECTED_MESSAGE = "An unexpected error occurred. Please try again."
 
 
 def _detail(message: str) -> dict:
+    """Wrap a user-facing message in the API error detail shape."""
     return {"message": message}
 
 
+def _format_duration(seconds: float) -> str:
+    """Format elapsed seconds as a short human-readable duration."""
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def _empty_db_response() -> QueryResponse:
+    """Return the standard response when no documents are indexed yet."""
     return QueryResponse(
         answer=EMPTY_DB_ANSWER,
         methods=[],
@@ -30,6 +50,7 @@ def _empty_db_response() -> QueryResponse:
 
 
 def _map_retrieval_error(exc: BaseException) -> HTTPException:
+    """Map retrieval exceptions to safe HTTP responses."""
     if isinstance(exc, BaseExceptionGroup):
         for inner in exc.exceptions:
             mapped = _map_retrieval_error(inner)
@@ -48,7 +69,6 @@ def _map_retrieval_error(exc: BaseException) -> HTTPException:
         or "fragment" in low
     ):
         return HTTPException(status_code=404, detail=_detail(EMPTY_DB_ANSWER))
-    plog("query", event="retrieve_error", error=str(exc)[:200])
     return HTTPException(
         status_code=500,
         detail=_detail(
@@ -58,6 +78,7 @@ def _map_retrieval_error(exc: BaseException) -> HTTPException:
 
 
 def _is_empty_db_error(exc: BaseException) -> bool:
+    """Return True when an exception represents an empty vector database."""
     mapped = _map_retrieval_error(exc)
     if mapped.status_code != 404:
         return False
@@ -65,35 +86,128 @@ def _is_empty_db_error(exc: BaseException) -> bool:
     return isinstance(detail, dict) and detail.get("message") == EMPTY_DB_ANSWER
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Collect the exception and its __cause__ chain."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__
+    return chain
+
+
+def _map_generation_error(exc: BaseException) -> HTTPException:
+    """Map generation failures to user-safe messages."""
+    for err in _exception_chain(exc):
+        if is_quota_error(err):
+            return HTTPException(status_code=429, detail=_detail(QUOTA_MESSAGE))
+    return HTTPException(status_code=500, detail=_detail(UNEXPECTED_MESSAGE))
+
+
+def _preview(text: str, limit: int = 80) -> str:
+    """Truncate long strings for log output."""
+    return text if len(text) <= limit else f"{text[: limit - 3]}..."
+
+
+async def _run_expand(query: str) -> str:
+    """Run query expansion and log when keywords are ready."""
+    result = await asyncio.to_thread(expand_query, query)
+    log("EXPAND", f"ready — \"{_preview(result)}\"")
+    return result
+
+
+async def _run_rewrite(query: str) -> str:
+    """Run query rewriting and log when the rewrite is ready."""
+    result = await asyncio.to_thread(rewrite_query, query)
+    log("REWRITE", f"ready — \"{_preview(result)}\"")
+    return result
+
+
+async def _hybrid_retrieval(
+    vector_store,
+    top_k: int,
+    expand_task: asyncio.Task[str],
+    rewrite_task: asyncio.Task[str],
+) -> list[dict]:
+    """BM25 on expanded keywords and semantic search on rewritten query, in parallel."""
+
+    async def bm25_branch() -> list[dict]:
+        expanded = await expand_task
+        docs = await asyncio.to_thread(vector_store.bm25, expanded, top_k)
+        log("HYBRID", f"BM25 found {len(docs)} chunks")
+        return docs
+
+    async def semantic_branch() -> list[dict]:
+        rewritten = await rewrite_task
+        vector = await asyncio.to_thread(vector_store.embedder.embed_query, rewritten)
+        docs = await asyncio.to_thread(vector_store.semantic_search, vector, top_k)
+        log("HYBRID", f"semantic found {len(docs)} chunks")
+        return docs
+
+    bm25_docs, semantic_docs = await asyncio.gather(bm25_branch(), semantic_branch())
+    merged = vector_store.merge_documents(bm25_docs, semantic_docs)
+    log("HYBRID", f"merged {len(merged)} unique chunks")
+    return merged
+
+
+async def _hyde_retrieval(
+    vector_store,
+    top_k: int,
+    rewrite_task: asyncio.Task[str],
+) -> list[dict]:
+    """HyDE retrieval using the rewritten query as soon as it is ready."""
+    rewritten = await rewrite_task
+    return await asyncio.to_thread(vector_store.hyde, rewritten, top_k)
+
+
 async def _retrieve_documents(
     vector_store,
     payload: QueryRequest,
 ) -> tuple[list[dict], list[str]]:
+    """Optimize the query, then run retrieval branches as each input becomes ready."""
     methods: list[str] = []
-    tasks: list = []
+    retrieval_tasks: list = []
+
+    log("QUERY", "optimizing — expansion + rewrite in parallel")
+    expand_task = asyncio.create_task(_run_expand(payload.query))
+    rewrite_task = asyncio.create_task(_run_rewrite(payload.query))
+
     if payload.hybrid:
         methods.append("hybrid")
-        tasks.append(vector_store.ahybrid_search(payload.query, payload.top_k))
+        retrieval_tasks.append(
+            _hybrid_retrieval(vector_store, payload.top_k, expand_task, rewrite_task)
+        )
     if payload.hyde:
         methods.append("hyde")
-        tasks.append(vector_store.ahyde(payload.query, payload.top_k))
-    results = await asyncio.gather(*tasks)
+        retrieval_tasks.append(_hyde_retrieval(vector_store, payload.top_k, rewrite_task))
+
+    log("QUERY", f"retrieving — methods: {', '.join(methods)}, top_k={payload.top_k}")
+    results = await asyncio.gather(*retrieval_tasks)
+
+    if not payload.hybrid:
+        try:
+            await expand_task
+        except Exception as exc:
+            log("EXPAND", f"unused (hyde-only) — {exc}")
+
     documents = vector_store.merge_documents(*results)
+    log("QUERY", f"retrieved {len(documents)} unique chunks")
     return documents, methods
 
 
 @router.post("/query")
 async def query(request: Request) -> QueryResponse:
+    """Handle a RAG query: retrieve chunks, rerank, then generate an answer."""
+    started_at = time.monotonic()
     vector_store = request.app.state.vector_store
     reranker = request.app.state.reranker
     generator = request.app.state.generator
-    timer = Timer()
 
     try:
         vector_store.ensure_queryable()
     except Exception as exc:
         if _is_empty_db_error(exc):
-            plog("query", event="empty_db", elapsed_s=timer.elapsed())
+            log("QUERY", "database is empty")
             return _empty_db_response()
         raise _map_retrieval_error(exc) from exc
 
@@ -108,47 +222,32 @@ async def query(request: Request) -> QueryResponse:
             detail=_detail("Invalid query request body."),
         ) from exc
 
-    plog(
-        "query",
-        event="start",
-        hybrid=body.hybrid,
-        hyde=body.hyde,
-        top_k=body.top_k,
-        query=body.query[:100],
-    )
+    preview = body.query if len(body.query) <= 80 else f"{body.query[:77]}..."
+    log("QUERY", f"started — \"{preview}\"")
 
     try:
-        t_ret = time.perf_counter()
         documents, methods = await _retrieve_documents(vector_store, body)
-        retrieval_seconds = time.perf_counter() - t_ret
     except Exception as exc:
         if _is_empty_db_error(exc):
-            plog("query", event="empty_db_mid_retrieve", elapsed_s=timer.elapsed())
+            log("QUERY", "database is empty")
             return _empty_db_response()
+        log("QUERY", f"retrieval failed — {exc}")
         raise _map_retrieval_error(exc) from exc
 
-    plog(
-        "query",
-        event="retrieved",
-        methods="+".join(methods) or "none",
-        docs=len(documents),
-        elapsed_s=retrieval_seconds,
-    )
-
     if not documents:
+        log("QUERY", "no matching documents found")
         raise HTTPException(
             status_code=404,
             detail=_detail("No matching documents were found for that query."),
         )
 
     try:
-        t_rr = time.perf_counter()
+        log("RERANK", f"reranking {len(documents)} chunks")
         reranked = await asyncio.to_thread(
             reranker.rerank, body.query, documents, body.top_k
         )
-        rerank_seconds = time.perf_counter() - t_rr
     except Exception as exc:
-        plog("query", event="rerank_error", error=str(exc)[:200])
+        log("RERANK", f"failed — {exc}")
         raise HTTPException(
             status_code=500,
             detail=_detail(
@@ -156,60 +255,29 @@ async def query(request: Request) -> QueryResponse:
             ),
         ) from exc
 
-    plog(
-        "query",
-        event="reranked",
-        kept=len(reranked),
-        from_docs=len(documents),
-        elapsed_s=rerank_seconds,
-    )
-
     if not reranked:
+        log("RERANK", "no chunks passed reranking")
         raise HTTPException(
             status_code=404,
             detail=_detail("No matching documents were found for that query."),
         )
 
+    log("RERANK", f"selected top {len(reranked)} chunks")
+
     try:
-        t_gen = time.perf_counter()
+        log("GENERATE", f"generating answer from {len(reranked)} chunks")
         answer = await asyncio.to_thread(
             generator.generate_response, body.query, reranked
         )
-        gen_seconds = time.perf_counter() - t_gen
     except Exception as exc:
-        api_exc = exc if isinstance(exc, genai_errors.APIError) else None
-        if api_exc is None and isinstance(getattr(exc, '__cause__', None), genai_errors.APIError):
-            api_exc = exc.__cause__
-        if api_exc is not None:
-            code = int(api_exc.code) if api_exc.code else 502
-            if code < 400 or code > 599:
-                code = 502
-            message = (api_exc.message or "").strip() or "The model is temporarily unavailable."
-            plog("query", event="generate_api_error", status=code, error=message[:160])
-            raise HTTPException(
-                status_code=code,
-                detail={"message": message, "status": api_exc.status},
-            ) from exc
-        plog("query", event="generate_error", error=str(exc)[:200])
-        raise HTTPException(
-            status_code=500,
-            detail=_detail(
-                "Something went wrong while generating the answer. Please try again."
-            ),
-        ) from exc
+        log("GENERATE", f"failed — {exc}")
+        raise _map_generation_error(exc) from exc
 
-    total_seconds = timer.elapsed()
-    plog(
-        "query",
-        event="done",
-        methods="+".join(methods),
-        retrieved=len(documents),
-        used=len(reranked),
-        retrieve_s=retrieval_seconds,
-        rerank_s=rerank_seconds,
-        generate_s=gen_seconds,
-        total_s=total_seconds,
-        answer_chars=len(answer),
+    elapsed = time.monotonic() - started_at
+    log(
+        "QUERY",
+        f"finished in {_format_duration(elapsed)} — "
+        f"{len(documents)} retrieved, {len(reranked)} used",
     )
 
     return QueryResponse(
