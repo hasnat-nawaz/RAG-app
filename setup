@@ -31,7 +31,7 @@ info "Frontend packages → $FRONTEND"
 if [[ ! -f "$ROOT/.env" && -f "$ROOT/.env.example" ]]; then
   info "Creating .env from .env.example"
   cp "$ROOT/.env.example" "$ROOT/.env"
-  printf '    Fill in GEMINI_API_KEY (and HF_TOKEN if needed) in .env\n'
+  printf '    Fill in GEMINI_API_KEY and HF_TOKEN in .env\n'
 fi
 
 info "Caching local models (reranker)"
